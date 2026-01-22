@@ -46,22 +46,26 @@ from habana_frameworks.torch.hpu import wrap_in_hpu_graph
 from transformers import AutoTokenizer
 from tokenizers import normalizers, Regex
 '''
-emb_device = torch.device("cpu") # "cpu" "hpu"
+emb_device = torch.device("cpu")
 hash_emb_device = torch.device("cpu")
-line_conv_device = torch.device("cpu") # "cpu" "hpu"
+linear_device = torch.device("cpu")
+conv_device = torch.device("cpu")
 layers_device = torch.device("cpu")
 '''
+'''
+emb_device = torch.device("hpu")
+hash_emb_device = torch.device("cpu")
+linear_device = torch.device("hpu") # "cpu" "hpu"
+conv_device = torch.device("hpu")
+layers_device = torch.device("hpu")
+'''
 
-emb_device = torch.device("hpu") # "cpu" "hpu"
+emb_device = torch.device("hpu")
 hash_emb_device = torch.device("cpu")
-line_conv_device = torch.device("hpu") # "cpu" "hpu"
+linear_device = torch.device("cpu") # "cpu" "hpu"
+conv_device = torch.device("hpu")
 layers_device = torch.device("hpu")
-'''
-emb_device = torch.device("hpu") # "cpu" "hpu"
-hash_emb_device = torch.device("cpu")
-line_conv_device = torch.device("cpu") # "cpu" "hpu"
-layers_device = torch.device("hpu")
-'''
+
 torch.manual_seed(102)
 np.random.seed(102)
 
@@ -234,10 +238,10 @@ class ShortConv(nn.Module):
             bias=False,
             padding=(kernel_size - 1) * dilation,
             dilation=dilation,
-        ).to(line_conv_device)
+        ).to(conv_device)
 
         self.norms = nn.ModuleList([
-            nn.RMSNorm(hidden_size, eps=norm_eps).to(line_conv_device)
+            nn.RMSNorm(hidden_size, eps=norm_eps).to(conv_device)
             for _ in range(hc_mult)
         ])
         
@@ -440,24 +444,26 @@ class Engram(nn.Module):
             hc_mult     = backbone_config.hc_mult,
         )
         engram_hidden_size = (engram_cfg.max_ngram_size-1) * engram_cfg.n_embed_per_ngram
-        self.value_proj = nn.Linear(engram_hidden_size,backbone_config.hidden_size).to(line_conv_device)
+        self.value_proj = nn.Linear(engram_hidden_size,backbone_config.hidden_size).to(linear_device)
         self.key_projs = nn.ModuleList(
-            [nn.Linear(engram_hidden_size, backbone_config.hidden_size).to(line_conv_device) for _ in range(backbone_config.hc_mult)]
+            [nn.Linear(engram_hidden_size, backbone_config.hidden_size).to(linear_device) for _ in range(backbone_config.hc_mult)]
         )
-        self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(line_conv_device) for _ in range(backbone_config.hc_mult)])
-        self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(line_conv_device) for _ in range(backbone_config.hc_mult)])
+        self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(linear_device) for _ in range(backbone_config.hc_mult)])
+        self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(conv_device) for _ in range(backbone_config.hc_mult)])
     
     def forward(self,hidden_states,input_ids):
         """
         hidden_states: [B, L, HC_MULT, D]
         input_ids: [B, L]
         """
+        # ***** This is a device boundary *****
         htcore.mark_step()
         input_ids = input_ids.to(hash_emb_device)
         hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
         embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-        embeddings=embeddings.to(line_conv_device)
-        hidden_states = hidden_states.to(line_conv_device)
+        embeddings=embeddings.to(conv_device)
+
+        # ***** This is a device boundary *****
         htcore.mark_step()
         gates = []
         for hc_idx in range(backbone_config.hc_mult):
@@ -475,19 +481,18 @@ class Engram(nn.Module):
         output = output.to(layers_device)
         return output
 
-    def forward_split(self,hidden_states,input_ids):
+    def forward_cpu(self,input_ids):
         """
         hidden_states: [B, L, HC_MULT, D]
         input_ids: [B, L]
         """
-        htcore.mark_step()
+        # ***** This is a device boundary *****
         input_ids = input_ids.to(hash_emb_device)
         hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
         embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-        embeddings=embeddings.to(line_conv_device)
-        hidden_states = hidden_states.to(line_conv_device)
-        htcore.mark_step()
+        embeddings=embeddings.to(linear_device)
 
+        # ***** Either This is a device boundary *****
         value = self.value_proj(embeddings).unsqueeze(2)
         normed_keys = []
         for hc_idx in range(backbone_config.hc_mult):
@@ -496,7 +501,12 @@ class Engram(nn.Module):
             normed_key = self.norm1[hc_idx](key)
             normed_keys.append(normed_key)
         normed_keys = torch.stack(normed_keys)
+        value=value.to(conv_device)
+        normed_keys=normed_keys.to(conv_device)
 
+        return value, normed_keys
+
+    def forward_hpu(self,hidden_states, value, normed_keys):
         gates = []
         for hc_idx in range(backbone_config.hc_mult):
             query = hidden_states[:,:,hc_idx,:]
@@ -510,42 +520,62 @@ class Engram(nn.Module):
         output = value + self.short_conv(value)
         output = output.to(layers_device)
         return output
-    
+
     def manual_profile(self,hidden_states,input_ids):
-        htcore.mark_step()
-        print(f"hash | input_ids: {input_ids.shape} {input_ids.dtype}")
+        #print(f"hash | input_ids: {input_ids.shape} {input_ids.dtype}")
         input_ids = input_ids.to(hash_emb_device)
         with self.timer.measure("hash_mapping.hash"):
             hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
-        print(f"embedding | hash_input_ids: {hash_input_ids.shape} {hash_input_ids.dtype}")
+        #print(f"embedding | hash_input_ids: {hash_input_ids.shape} {hash_input_ids.dtype}")
         with self.timer.measure("multi_head_embedding"):
             embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-        print(f"H2D/projs | embeddings: {embeddings.shape} {embeddings.dtype}")
+        #print(f"H2D/projs | embeddings: {embeddings.shape} {embeddings.dtype}")
         with self.timer.measure("embeddings.to"):
-            embeddings=embeddings.to(line_conv_device)
-        hidden_states = hidden_states.to(line_conv_device)
-        htcore.mark_step()
-        gates = []
-        with self.timer.measure("proj and gate"):
+            embeddings=embeddings.to(linear_device)
+        hidden_states = hidden_states.to(conv_device)
+
+        with self.timer.measure("value_proj"):
+            value = self.value_proj(embeddings).unsqueeze(2)
+        with self.timer.measure("value.to"):
+            value = value.to(conv_device)
+
+        normed_keys = []
+        with self.timer.measure("key_projs"):
             for hc_idx in range(backbone_config.hc_mult):
                 key = self.key_projs[hc_idx](embeddings)
                 normed_key = self.norm1[hc_idx](key)
+                normed_keys.append(normed_key)
+            normed_keys = torch.stack(normed_keys)
+        with self.timer.measure("normed_keys.to"):
+            normed_keys = normed_keys.to(conv_device)
+
+        gates = []
+        with self.timer.measure("scaled_dot_product_gates"):
+            for hc_idx in range(backbone_config.hc_mult):
                 query = hidden_states[:,:,hc_idx,:]
                 normed_query = self.norm2[hc_idx](query)
-                gate = (normed_key * normed_query).sum(dim=-1) / math.sqrt(backbone_config.hidden_size)
+                gate = (normed_keys[hc_idx] * normed_query).sum(dim=-1) / math.sqrt(backbone_config.hidden_size)
                 gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
                 gate = gate.sigmoid().unsqueeze(-1)
                 gates.append(gate)
             gates = torch.stack(gates,dim=2)
-            value = gates * self.value_proj(embeddings).unsqueeze(2)
+            value = gates * value
             
-        print(f"short_conv | value: {value.shape} {value.dtype}")
+        #print(f"short_conv | value: {value.shape} {value.dtype}")
         with self.timer.measure("short_conv"):
             output = value + self.short_conv(value)
             output = output.to(layers_device)
         htcore.mark_step()
         return output
 
+class EngramHPUWrapper(nn.Module):
+    def __init__(self, engram_instance):
+        super().__init__()
+        self.engram = engram_instance
+        
+    def forward(self, hidden_states, value, normed_keys):
+        return self.engram.forward_hpu(hidden_states, value, normed_keys)
+    
 class Embedding(nn.Module):
     def __init__(self,vocab_size,hidden_size):
         super().__init__()
@@ -565,11 +595,19 @@ class TransformerBlock(nn.Module):
         self.engram = None
         if layer_id in engram_cfg.layer_ids:
             self.engram = Engram(layer_id=layer_id, timer=timer)
+
+            engram_wrapper = EngramHPUWrapper(self.engram)
+            self._engram_hpu_graph_wrapper = wrap_in_hpu_graph(engram_wrapper)
     
     def forward(self,input_ids,hidden_states, profile_engram=False):
         if self.engram is not None:
             if not profile_engram:
-                hidden_states = self.engram(hidden_states=hidden_states,input_ids=input_ids) + hidden_states
+                #hidden_states = self.engram(hidden_states=hidden_states,input_ids=input_ids) + hidden_states
+                value, normed_keys = self.engram.forward_cpu(input_ids=input_ids)
+                if self._engram_hpu_graph_wrapper is not None:
+                    hidden_states = self._engram_hpu_graph_wrapper(hidden_states, value, normed_keys) + hidden_states
+                else:
+                    hidden_states = self.engram.forward_hpu(hidden_states, value, normed_keys) + hidden_states
             else:
                 hidden_states = self.engram.manual_profile(hidden_states=hidden_states,input_ids=input_ids) + hidden_states
         hidden_states = hidden_states.to(layers_device)
@@ -589,8 +627,6 @@ class LLM(nn.Module):
 
     def forward(self, input_ids, profile_engram=False):
         hidden_states = self.vocab_embed_tokens(input_ids)
-        if line_conv_device == layers_device:
-            hidden_states = hidden_states.to(layers_device)
         ## mock hyper-connection
         hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_config.hc_mult, -1)
         for layer in self.decoder_layers:
@@ -601,44 +637,22 @@ class LLM(nn.Module):
         return output, self.timer
 
 if __name__ == '__main__':
-    # LLM = [
-    #     nn.Embedding(backbone_config.vocab_size,backbone_config.hidden_size),
-    #     *[TransformerBlock(layer_id=layer_id) for layer_id in range(backbone_config.num_layers)],
-    #     nn.Linear(backbone_config.hidden_size, backbone_config.vocab_size),
-    # ]
-    # for idx, layer in enumerate(LLM):
-    #     if idx == 0:
-    #         hidden_states = LLM[0](input_ids)
-    #         ## mock hyper-connection
-    #         hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_config.hc_mult, -1)      
-    #     elif idx == len(LLM)-1:
-    #         ## mock hyper-connection
-    #         hidden_states = hidden_states[:,:,0,:] 
-    #         output = layer(hidden_states)
-    #     else:
-    #         hidden_states = layer(input_ids=input_ids,hidden_states=hidden_states)
-
-    # embed_tokens = nn.Embedding(backbone_config.vocab_size,backbone_config.hidden_size).to(emb_device)
-    # decoder_layers = [TransformerBlock(layer_id=layer_id) for layer_id in range(backbone_config.num_layers)]
-    # lm_head = nn.Linear(backbone_config.hidden_size, backbone_config.vocab_size).to(layers_device)
-
-    # text = "Only Alexander the Great could tame the horse Bucephalus."
-    input_b, input_seq = 1, 14
-    #input_b, input_seq = 16, 1
+    input_b, input_seq = 16, 1
     #input_b, input_seq = 1, 8*1024
     #input_b, input_seq = 1, 1
     text = ["hi " * (input_seq-2)] * input_b
+    text = "Only Alexander the Great could tame the horse Bucephalus."
     tokenizer = AutoTokenizer.from_pretrained(engram_cfg.tokenizer_name_or_path,trust_remote_code=True)
     input_ids = tokenizer(text,return_tensors='pt').input_ids
     
-    input_ids = torch.randint(0, 127000, input_ids.shape, dtype=torch.long)
+    #input_ids = torch.randint(0, 127000, input_ids.shape, dtype=torch.long)
+    input_ids = input_ids.to("hpu")  # in case all CPU that mark_step fails
     input_ids = input_ids.to(emb_device)
 
     B,L = input_ids.shape
     print(f"input_ids: {input_ids.shape} {input_ids.device}")
 
     llm = LLM()
-    llm = wrap_in_hpu_graph(llm)
     llm.eval()
 
     warmup_iters = 50
@@ -649,11 +663,13 @@ if __name__ == '__main__':
             htcore.mark_step()
 
     loop_iters = 1000
+    output=None
     start_time = time.perf_counter()
     with torch.no_grad():
         for i in range(loop_iters):
             input_ids_local = input_ids + i
-            output, _ =  llm(input_ids_local)
+            output_new, _ =  llm(input_ids_local)
+            output = output_new + output if output is not None else output_new
             htcore.mark_step()
     end_time = time.perf_counter()
     execution_time = (end_time - start_time) * 1000
@@ -665,10 +681,10 @@ if __name__ == '__main__':
     with torch.no_grad():
         for i in range(loop_iters):
             input_ids_local = input_ids + i
-            output_new, times_ms =  llm(input_ids_local, profile_engram=True)
+            output_new, times_ms = llm(input_ids_local, profile_engram=True)
             output = output_new + output if output is not None else output_new
             htcore.mark_step()
-    print("\nForward Complete with Timing!\nProfiling times_ms:\n", times_ms)
+    print(f"\nForward Complete with Timing!\nProfiling times_ms:\n{times_ms}")
 
     output = None
     with torch.profiler.profile(
@@ -679,21 +695,20 @@ if __name__ == '__main__':
         with_stack=True,
         on_trace_ready=torch.profiler.tensorboard_trace_handler('./profile_logs')
     ) as profiler:
-        for i in range(int(10)):
-            '''
-            hidden_states = embed_tokens(input_ids)
-            if line_conv_device == layers_device:
-                hidden_states = hidden_states.to(layers_device)
-            ## mock hyper-connection
-            hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_config.hc_mult, -1)
-            for layer in decoder_layers:
-                hidden_states = layer(input_ids=input_ids,hidden_states=hidden_states)
-            ## mock hyper-connection
-            hidden_states = hidden_states[:,:,0,:] 
-            output = lm_head(hidden_states)
-            '''
-            output, _ =  llm(input_ids)
-            htcore.mark_step()
-            htcore.hpu.synchronize()
-            profiler.step()
+        with torch.no_grad():
+            for i in range(int(10)):
+                '''
+                hidden_states = embed_tokens(input_ids)
+                ## mock hyper-connection
+                hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_config.hc_mult, -1)
+                for layer in decoder_layers:
+                    hidden_states = layer(input_ids=input_ids,hidden_states=hidden_states)
+                ## mock hyper-connection
+                hidden_states = hidden_states[:,:,0,:] 
+                output = lm_head(hidden_states)
+                '''
+                output, _ =  llm(input_ids)
+                htcore.mark_step()
+                htcore.hpu.synchronize()
+                profiler.step()
     print("\nForward Complete with Profiling!")
