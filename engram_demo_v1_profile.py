@@ -21,8 +21,13 @@ DISCLAIMER:
 """
 pip install torch numpy transformers sympy
 """
+
+# python engram_demo_v1_profile.py --batch-size 1 --seq-len 1024 --n-embed-per-ngram 2560 --hidden-size 4096 --dtype bf16
+
 import os
 import time
+import glob
+import argparse
 os.environ['PT_HPU_LAZY_MODE'] = '1'
 os.environ['HABANA_PROFILE'] = '1'
 
@@ -72,7 +77,7 @@ np.random.seed(102)
 class StepTimer:
     def __init__(self):
         self.stats: Dict[str, Dict[str, float]] = {}
-        times = 0
+        self.total = 1
 
     @contextmanager
     def measure(self, name: str):
@@ -93,9 +98,24 @@ class StepTimer:
         for name, stats in self.stats.items():
             avg_time = stats['time_ms'] / stats['count'] if stats['count'] > 0 else 0
             lines.append(f"{name}: 总时间={stats['time_ms']:.2f}ms, "
-                        f"次数={stats['count']}, "
-                        f"平均={avg_time:.2f}ms")
+                        f"\t次数={stats['count']}, "
+                        f"\t平均={avg_time:.2f}ms"
+                        f"\t占比={avg_time*100/self.total:5.2f}%")
         return "\n".join(lines)
+
+def human_format(num):
+    magnitude = 0
+    #while abs(num) >= 1000:
+    while magnitude < 3:
+        magnitude += 1
+        num /= 1000.0
+    return "{}{}".format('{:f}'.format(num).rstrip('0').rstrip('.'), ['', 'K', 'M', 'B', 'T'][magnitude])
+
+def get_latest_trace_file(log_dir="./logs"):
+    trace_files = glob.glob(os.path.join(log_dir, "*.pt.trace.json"))
+    if not trace_files:
+        return None
+    return max(trace_files, key=os.path.getctime)
 
 
 ''' # Original Config
@@ -151,6 +171,7 @@ class BackBoneConfig:
     
 engram_cfg = EngramConfig()
 backbone_config = BackBoneConfig()
+
 
 class CompressedTokenizer:
     def __init__(
@@ -451,20 +472,18 @@ class Engram(nn.Module):
         self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(linear_device) for _ in range(backbone_config.hc_mult)])
         self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(conv_device) for _ in range(backbone_config.hc_mult)])
     
+        print(f"[Engram]: multi_head_embedding[{layer_id}]: num_embeddings={self.multi_head_embedding.mhe_embedding.num_embeddings}, embedding_dim={self.multi_head_embedding.mhe_embedding.embedding_dim}, params={human_format(self.multi_head_embedding.mhe_embedding.num_embeddings*self.multi_head_embedding.mhe_embedding.embedding_dim)}")
+
     def forward(self,hidden_states,input_ids):
         """
         hidden_states: [B, L, HC_MULT, D]
         input_ids: [B, L]
         """
-        # ***** This is a device boundary *****
-        htcore.mark_step()
         input_ids = input_ids.to(hash_emb_device)
         hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
         embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-        embeddings=embeddings.to(conv_device)
+        embeddings=embeddings.to(linear_device)
 
-        # ***** This is a device boundary *****
-        htcore.mark_step()
         gates = []
         for hc_idx in range(backbone_config.hc_mult):
             key = self.key_projs[hc_idx](embeddings)
@@ -518,35 +537,32 @@ class Engram(nn.Module):
         gates = torch.stack(gates,dim=2)
         value = gates * value
         output = value + self.short_conv(value)
-        output = output.to(layers_device)
         return output
 
     def manual_profile(self,hidden_states,input_ids):
-        #print(f"hash | input_ids: {input_ids.shape} {input_ids.dtype}")
-        input_ids = input_ids.to(hash_emb_device)
-        with self.timer.measure("hash_mapping.hash"):
+        with self.timer.measure("input_ids.to            "):
+            input_ids = input_ids.to(hash_emb_device)
+        with self.timer.measure("hash_mapping.hash       "):
             hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
-        #print(f"embedding | hash_input_ids: {hash_input_ids.shape} {hash_input_ids.dtype}")
-        with self.timer.measure("multi_head_embedding"):
+        with self.timer.measure("multi_head_embedding    "):
             embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-        #print(f"H2D/projs | embeddings: {embeddings.shape} {embeddings.dtype}")
-        with self.timer.measure("embeddings.to"):
+        with self.timer.measure("embeddings.to           "):
             embeddings=embeddings.to(linear_device)
         hidden_states = hidden_states.to(conv_device)
 
-        with self.timer.measure("value_proj"):
+        with self.timer.measure("value_proj              "):
             value = self.value_proj(embeddings).unsqueeze(2)
-        with self.timer.measure("value.to"):
+        with self.timer.measure("value_proj.to           "):
             value = value.to(conv_device)
 
         normed_keys = []
-        with self.timer.measure("key_projs"):
+        with self.timer.measure("key_projs               "):
             for hc_idx in range(backbone_config.hc_mult):
                 key = self.key_projs[hc_idx](embeddings)
                 normed_key = self.norm1[hc_idx](key)
                 normed_keys.append(normed_key)
             normed_keys = torch.stack(normed_keys)
-        with self.timer.measure("normed_keys.to"):
+        with self.timer.measure("normed_keys.to          "):
             normed_keys = normed_keys.to(conv_device)
 
         gates = []
@@ -561,11 +577,9 @@ class Engram(nn.Module):
             gates = torch.stack(gates,dim=2)
             value = gates * value
             
-        #print(f"short_conv | value: {value.shape} {value.dtype}")
-        with self.timer.measure("short_conv"):
+        with self.timer.measure("short_conv              "):
             output = value + self.short_conv(value)
-            output = output.to(layers_device)
-        htcore.mark_step()
+
         return output
 
 class EngramHPUWrapper(nn.Module):
@@ -573,8 +587,8 @@ class EngramHPUWrapper(nn.Module):
         super().__init__()
         self.engram = engram_instance
         
-    def forward(self, hidden_states, value, normed_keys):
-        return self.engram.forward_hpu(hidden_states, value, normed_keys)
+    def forward(self, *args, **kwargs):
+        return self.engram.forward_hpu(*args, **kwargs)
     
 class Embedding(nn.Module):
     def __init__(self,vocab_size,hidden_size):
@@ -593,6 +607,7 @@ class TransformerBlock(nn.Module):
         self.attn = lambda x:x
         self.moe  = lambda x:x
         self.engram = None
+        self.timer = timer
         if layer_id in engram_cfg.layer_ids:
             self.engram = Engram(layer_id=layer_id, timer=timer)
 
@@ -602,12 +617,12 @@ class TransformerBlock(nn.Module):
     def forward(self,input_ids,hidden_states, profile_engram=False):
         if self.engram is not None:
             if not profile_engram:
-                #hidden_states = self.engram(hidden_states=hidden_states,input_ids=input_ids) + hidden_states
+                '''
+                hidden_states = self.engram(hidden_states=hidden_states,input_ids=input_ids) + hidden_states
+                '''
                 value, normed_keys = self.engram.forward_cpu(input_ids=input_ids)
-                if self._engram_hpu_graph_wrapper is not None:
+                with self.timer.measure("engram_hpu_graph_wrapper"):
                     hidden_states = self._engram_hpu_graph_wrapper(hidden_states, value, normed_keys) + hidden_states
-                else:
-                    hidden_states = self.engram.forward_hpu(hidden_states, value, normed_keys) + hidden_states
             else:
                 hidden_states = self.engram.manual_profile(hidden_states=hidden_states,input_ids=input_ids) + hidden_states
         hidden_states = hidden_states.to(layers_device)
@@ -623,7 +638,7 @@ class LLM(nn.Module):
         self.decoder_layers = nn.ModuleList(
             [TransformerBlock(layer_id=layer_id,timer=self.timer) for layer_id in range(backbone_config.num_layers)]
         )
-        self.lm_head = nn.Linear(backbone_config.hidden_size, backbone_config.vocab_size).to(layers_device)
+        #self.lm_head = nn.Linear(backbone_config.hidden_size, backbone_config.vocab_size).to(layers_device)
 
     def forward(self, input_ids, profile_engram=False):
         hidden_states = self.vocab_embed_tokens(input_ids)
@@ -633,24 +648,51 @@ class LLM(nn.Module):
             hidden_states = layer(input_ids=input_ids,hidden_states=hidden_states, profile_engram=profile_engram)
         ## mock hyper-connection
         output = hidden_states[:,:,0,:]
-        output = self.lm_head(output)
+        #output = self.lm_head(output)
         return output, self.timer
 
+# python engram_demo_v1_profile.py --batch-size 1 --seq-len 1024 --n-embed-per-ngram 2560 --hidden-size 4096 --dtype bf16
 if __name__ == '__main__':
-    input_b, input_seq = 16, 1
-    #input_b, input_seq = 1, 8*1024
-    #input_b, input_seq = 1, 1
-    text = ["hi " * (input_seq-2)] * input_b
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--batch-size', type=int, default=16, help='Batch size.')
+    parser.add_argument('--seq-len', type=int, default=1, help='Sequence length.')
+    parser.add_argument('--n-embed-per-ngram', type=int, default=512, help='Embedding dims per ngram.')
+    parser.add_argument('--hidden-size', type=int, default=1024, help='Embedding dims for Transformer (Hidden size).')
+    parser.add_argument('--dtype', type=str, default="fp32", help='data type.')
+    args = parser.parse_args()
+
+    backbone_config.hidden_size = int(args.hidden_size)
+    engram_cfg.n_embed_per_ngram = int(args.n_embed_per_ngram)
+    if args.dtype == "fp16":
+        torch.set_default_dtype(torch.float16)
+    elif args.dtype == "bf16":
+        torch.set_default_dtype(torch.bfloat16)
+    else:
+        torch.set_default_dtype(torch.float32)
+
+    '''
     text = "Only Alexander the Great could tame the horse Bucephalus."
     tokenizer = AutoTokenizer.from_pretrained(engram_cfg.tokenizer_name_or_path,trust_remote_code=True)
     input_ids = tokenizer(text,return_tensors='pt').input_ids
-    
-    #input_ids = torch.randint(0, 127000, input_ids.shape, dtype=torch.long)
+    '''
+    #input_b, input_seq = 16, 1
+    #input_b, input_seq = 1, 8*1024
+    #input_b, input_seq = 1, 1
+    input_b, input_seq = int(args.batch_size), int(args.seq_len)
+    input_ids = torch.randint(0, 127000, size=(input_b, input_seq), dtype=torch.long)
+
     input_ids = input_ids.to("hpu")  # in case all CPU that mark_step fails
     input_ids = input_ids.to(emb_device)
 
     B,L = input_ids.shape
-    print(f"input_ids: {input_ids.shape} {input_ids.device}")
+    print(f"\n******** Engram Configuration ********")
+    print(f"[Engram]: n_embed_per_ngram = {engram_cfg.n_embed_per_ngram}")
+    print(f"[Engram]: hidden_size       = {backbone_config.hidden_size}")
+    print(f"[Engram]: input_ids: {input_ids.shape} {input_ids.device}")
+    print(f"[Engram]: embeddings: [B, T, (N-1)*n_embed_per_ngram] = [{B}, {L}, {engram_cfg.max_ngram_size-1}*{engram_cfg.n_embed_per_ngram}] = [{B}, {L}, {(engram_cfg.max_ngram_size-1)*engram_cfg.n_embed_per_ngram}]")
+    print(f"[Engram]: key_projs : [hc][B, T, H] = [{backbone_config.hc_mult}][{B}, {L}, {backbone_config.hidden_size}]")
+    print(f"[Engram]: value_proj:     [B, T, H] =    [{B}, {L}, {backbone_config.hidden_size}]")
+    print(f"[Engram]: default dtype: {torch.get_default_dtype()}")
 
     llm = LLM()
     llm.eval()
@@ -672,9 +714,10 @@ if __name__ == '__main__':
             output = output_new + output if output is not None else output_new
             htcore.mark_step()
     end_time = time.perf_counter()
-    execution_time = (end_time - start_time) * 1000
+    execution_time = (end_time - start_time) * 1000 / loop_iters
+    print(f"**************************************\n")
     print(output)
-    print(f"Inference F32 Time: {execution_time/loop_iters} ms per loop")
+    print(f"Inference {torch.get_default_dtype()} Time: {execution_time} ms per loop")
 
     loop_iters = 1000
     output=None
@@ -684,6 +727,7 @@ if __name__ == '__main__':
             output_new, times_ms = llm(input_ids_local, profile_engram=True)
             output = output_new + output if output is not None else output_new
             htcore.mark_step()
+    times_ms.total = execution_time
     print(f"\nForward Complete with Timing!\nProfiling times_ms:\n{times_ms}")
 
     output = None
@@ -711,4 +755,5 @@ if __name__ == '__main__':
                 htcore.mark_step()
                 htcore.hpu.synchronize()
                 profiler.step()
-    print("\nForward Complete with Profiling!")
+    trace_file = get_latest_trace_file(log_dir="./profile_logs")
+    print(f"\nForward Complete with Profiling!\nTrace file saved at: {trace_file}")
