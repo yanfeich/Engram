@@ -35,14 +35,17 @@ import torch.nn as nn
 from transformers import AutoTokenizer
 from tokenizers import normalizers, Regex 
 
+torch.manual_seed(102)
+np.random.seed(102)
+
 @dataclass
 class EngramConfig:
-    tokenizer_name_or_path: str = "deepseek-ai/DeepSeek-V3"
+    tokenizer_name_or_path: str = "/mnt/disk8/hf_models/DeepSeek-V3"
     engram_vocab_size: List[int] = field(default_factory=lambda: [129280*5, 129280*5])
     max_ngram_size: int = 3
     n_embed_per_ngram: int = 512
     n_head_per_ngram: int = 8
-    layer_ids: List[int] = field(default_factory=lambda: [1, 15])
+    layer_ids: List[int] = field(default_factory=lambda: [1])
     pad_id: int = 2
     seed: int = 0
     kernel_size: int = 4
@@ -52,7 +55,7 @@ class BackBoneConfig:
     hidden_size: int = 1024
     hc_mult: int = 4
     vocab_size: int = 129280
-    num_layers: int = 30
+    num_layers: int = 4
     
 engram_cfg = EngramConfig()
 backbone_config = BackBoneConfig()
@@ -278,7 +281,7 @@ class NgramHashMapping:
         base_shifts = [shift_k(k) for k in range(self.max_ngram_size)]
 
         all_hashes = []
-        
+
         for n in range(2, self.max_ngram_size + 1):
             n_gram_index = n - 2
             tokens = base_shifts[:n]
@@ -287,12 +290,12 @@ class NgramHashMapping:
                 mix = np.bitwise_xor(mix, tokens[k] * multipliers[k])
             num_heads_for_this_ngram = self.n_head_per_ngram
             head_vocab_sizes = self.vocab_size_across_layers[layer_id][n_gram_index]
-            
+
             for j in range(num_heads_for_this_ngram):
                 mod = int(head_vocab_sizes[j])
                 head_hash = mix % mod
                 all_hashes.append(head_hash.astype(np.int64, copy=False))
-        
+
         return np.stack(all_hashes, axis=2)
 
     def hash(self, input_ids):
@@ -322,7 +325,7 @@ class MultiHeadEmbedding(nn.Module):
         output = self.embedding(shifted_input_ids)
         
         return output
-    
+
 class Engram(nn.Module):
     def __init__(self, layer_id):
         super().__init__()
@@ -406,18 +409,22 @@ if __name__ == '__main__':
 
     B,L = input_ids.shape
 
-    for idx, layer in enumerate(LLM):
-        if idx == 0:
-            hidden_states = LLM[0](input_ids)
-            ## mock hyper-connection
-            hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_config.hc_mult, -1)      
-        elif idx == len(LLM)-1:
-            ## mock hyper-connection
-            hidden_states = hidden_states[:,:,0,:] 
-            output = layer(hidden_states)
-        else:
-            hidden_states = layer(input_ids=input_ids,hidden_states=hidden_states)
+    loop_iters = 1000
+    output=None
+    for i in range(loop_iters):
+        for idx, layer in enumerate(LLM):
+            if idx == 0:
+                hidden_states = LLM[0](input_ids+i)
+                ## mock hyper-connection
+                hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_config.hc_mult, -1)
+            elif idx == len(LLM)-1:
+                ## mock hyper-connection
+                hidden_states = hidden_states[:,:,0,:]
+                output_new = layer(hidden_states)
+                output = output_new + output if output is not None else output_new
+            else:
+                hidden_states = layer(input_ids=input_ids+i,hidden_states=hidden_states)
 
     print("✅ Forward Complete!")
-    print(f"{input_ids.shape=}\n{output.shape=}")
-            
+    print(f"{input_ids.shape=} {hidden_states.shape=}\n{hidden_states}")  # skip Linear layer
+    print(f"{input_ids.shape=} {output.shape=}\n{output}")
