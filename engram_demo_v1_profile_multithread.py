@@ -458,26 +458,33 @@ class Engram_host(nn.Module):
         self.engram_outputs = {}
     
         print(f"[Engram]: multi_head_embedding[{layer_id}]: num_embeddings={self.multi_head_embedding.mhe_embedding.num_embeddings}, embedding_dim={self.multi_head_embedding.mhe_embedding.embedding_dim}, params={human_format(self.multi_head_embedding.mhe_embedding.num_embeddings*self.multi_head_embedding.mhe_embedding.embedding_dim)}")
+        
+        # For shortest CPU time test use only
+        self.fake_value = torch.zeros((B,L,1,backbone_config.hidden_size),dtype=torch.get_default_dtype())
+        self.fake_keys = torch.zeros((backbone_config.hc_mult,B,L,backbone_config.hidden_size),dtype=torch.get_default_dtype())
 
     def forward(self,input_ids):
         """
         hidden_states: [B, L, HC_MULT, D]
         input_ids: [B, L]
         """
-        # ***** This is a device boundary *****
-        hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids,self.layer_id))
-        embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-        embeddings=embeddings.to(cpu_device)
+        with self.timer.measure("host time       "):
+            '''
+            value = self.fake_value
+            normed_keys = self.fake_keys
+            '''
+            hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids,self.layer_id))
+            embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
+            #embeddings=embeddings.to(cpu_device)
 
-        # ***** Either This is a device boundary *****
-        value = self.value_proj(embeddings).unsqueeze(2)
-        normed_keys = []
-        for hc_idx in range(backbone_config.hc_mult):
-            key = self.key_projs[hc_idx](embeddings)
-            # norm1 可以在 CPU / HPU 上做, 也需要适当 norm1.to(device)
-            normed_key = self.norm1[hc_idx](key)
-            normed_keys.append(normed_key)
-        normed_keys = torch.stack(normed_keys)
+            value = self.value_proj(embeddings).unsqueeze(2)
+            normed_keys = []
+            for hc_idx in range(backbone_config.hc_mult):
+                key = self.key_projs[hc_idx](embeddings)
+                # norm1 可以在 CPU / HPU 上做, 也需要适当 norm1.to(device)
+                normed_key = self.norm1[hc_idx](key)
+                normed_keys.append(normed_key)
+            normed_keys = torch.stack(normed_keys)
         return value, normed_keys
 
     def forward_ref(self,hidden_states,input_ids):
@@ -549,6 +556,7 @@ class Engram_host(nn.Module):
 
         return output
 
+@wrap_in_hpu_graph
 class Engram_device(nn.Module):
     def __init__(self, layer_id,timer):
         super().__init__()
@@ -577,6 +585,7 @@ class Engram_device(nn.Module):
         gates = torch.stack(gates,dim=2)
         value = gates * value
         output = value + self.short_conv(value)
+        htcore.mark_step()
         return output
 
     
@@ -638,24 +647,19 @@ class EngramManager:
     def __init__(self, layer_ids, timer):
         self.layer_ids = layer_ids
         self.timer = timer
-        # self.engram_layers_host = nn.ModuleList(
-        #     [Engram_host(layer_id=layer_id,timer=self.timer) for layer_id in engram_cfg.layer_ids]
-        # )
         self.engram_layers_host = nn.ModuleList(
             [Engram_host(layer_id=layer_id,timer=self.timer) for layer_id in self.layer_ids]
         )
         
         self.threads = {}
-        self.results: Dict[int, Tuple[Any, Any]] = {layer_id: (None, None) for layer_id in self.layer_ids}
+        self.results: Dict[int, Tuple[Any, Any, Any]] = {layer_id: (None, None, None) for layer_id in self.layer_ids}
 
     def _compute_layer(self, layer_id, input_ids):
         layer = self.engram_layers_host[self.layer_ids.index(layer_id)]
         
         value, normed_keys = layer(input_ids=input_ids)
-        value = value.to("hpu", non_blocking=True)
-        normed_keys = normed_keys.to("hpu", non_blocking=True)
        
-        self.results[layer_id] = (value, normed_keys)
+        self.results[layer_id] = (value, normed_keys, None)
 
     def start_async_computation(self, input_ids):
         '''
@@ -672,15 +676,23 @@ class EngramManager:
             )
             self.threads[layer_id] = thread
             thread.start()
+        for layer_id in self.layer_ids:
+            self.threads[layer_id].join(timeout=1.0)
+            value, normed_keys, _ = self.results[layer_id]
+
+            value = value.to("hpu", non_blocking=True)
+            normed_keys = normed_keys.to("hpu", non_blocking=True)
+            htcore.mark_step()
+
+            event = torch.hpu.Event()
+            torch.hpu.current_stream().record_event(event)
+            self.results[layer_id] = (value, normed_keys, event)
 
     def get_engram_output(self, layer_id):
         assert layer_id in self.layer_ids, f"Layer ID {layer_id} not in Engram layers {self.layer_ids}"
         assert layer_id in self.threads, f"Layer ID {layer_id} not in Engram threads {self.layer_ids}"
 
-        self.threads[layer_id].join(timeout=1.0)
-        value, normed_keys = self.results[layer_id]
-        event = torch.hpu.Event()
-        torch.hpu.current_stream().record_event(event)
+        value, normed_keys, event = self.results[layer_id]
         event.synchronize()
         
         return value, normed_keys
