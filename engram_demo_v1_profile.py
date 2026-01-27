@@ -438,18 +438,14 @@ class MultiHeadEmbedding(nn.Module):
         return output
     
 class Engram(nn.Module):
-    def __init__(self, layer_id,timer,np_state=None,tch_state=None):
+    def __init__(self, layer_id,timer):
         super().__init__()
         self.timer = timer
         self.layer_id = layer_id
-        if np_state is None:
-            self.np_state = np.random.get_state()
-        else:
-            np.random.set_state(np_state)
-        if tch_state is None:
-            self.tch_state = torch.get_rng_state()
-        else:
-            torch.set_rng_state(tch_state)
+        
+        torch.manual_seed(102)
+        np.random.seed(102)
+
         self.hash_mapping = NgramHashMapping(
             engram_vocab_size=engram_cfg.engram_vocab_size,
             max_ngram_size = engram_cfg.max_ngram_size,
@@ -549,9 +545,34 @@ class Engram(nn.Module):
 
         return output
 
-class Engram_host(Engram):
-    def __init__(self, layer_id,timer,np_state=None,tch_state=None):
-        super().__init__(layer_id,timer,np_state,tch_state)
+class Engram_host(nn.Module):
+    def __init__(self, layer_id,timer):
+        super().__init__()
+        self.timer = timer
+        self.layer_id = layer_id
+
+        self.hash_mapping = NgramHashMapping(
+            engram_vocab_size=engram_cfg.engram_vocab_size,
+            max_ngram_size = engram_cfg.max_ngram_size,
+            n_embed_per_ngram = engram_cfg.n_embed_per_ngram,
+            n_head_per_ngram = engram_cfg.n_head_per_ngram,
+            layer_ids = engram_cfg.layer_ids,
+            tokenizer_name_or_path=engram_cfg.tokenizer_name_or_path,
+            pad_id = engram_cfg.pad_id,
+            seed = engram_cfg.seed,
+        )
+        self.multi_head_embedding = MultiHeadEmbedding(
+            list_of_N = [x for y in self.hash_mapping.vocab_size_across_layers[self.layer_id] for x in y],
+            D = engram_cfg.n_embed_per_ngram // engram_cfg.n_head_per_ngram,
+        )
+
+        engram_hidden_size = (engram_cfg.max_ngram_size-1) * engram_cfg.n_embed_per_ngram
+        self.value_proj = nn.Linear(engram_hidden_size,backbone_config.hidden_size).to(linear_device)
+        self.key_projs = nn.ModuleList(
+            [nn.Linear(engram_hidden_size, backbone_config.hidden_size).to(linear_device) for _ in range(backbone_config.hc_mult)]
+        )
+        self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(linear_device) for _ in range(backbone_config.hc_mult)])
+        print(f"[Engram]: multi_head_embedding[{layer_id}]: num_embeddings={self.multi_head_embedding.mhe_embedding.num_embeddings}, embedding_dim={self.multi_head_embedding.mhe_embedding.embedding_dim}, params={human_format(self.multi_head_embedding.mhe_embedding.num_embeddings*self.multi_head_embedding.mhe_embedding.embedding_dim)}")
 
     def forward(self,input_ids):
         """
@@ -578,10 +599,21 @@ class Engram_host(Engram):
 
         return value, normed_keys
 
-class Engram_device(Engram):
-    def __init__(self, layer_id,timer,np_state=None,tch_state=None):
-        super().__init__(layer_id,timer,np_state,tch_state)
+class Engram_device(nn.Module):
+    def __init__(self, layer_id,timer):
+        super().__init__()
+        self.timer = timer
+        self.layer_id = layer_id
 
+        self.short_conv = ShortConv(
+            hidden_size = backbone_config.hidden_size,
+            kernel_size = engram_cfg.kernel_size,
+            dilation    = engram_cfg.max_ngram_size,
+            hc_mult     = backbone_config.hc_mult,
+        )
+
+        self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(conv_device) for _ in range(backbone_config.hc_mult)])
+    
     def forward(self,hidden_states, value, normed_keys):
         gates = []
         for hc_idx in range(backbone_config.hc_mult):
@@ -618,14 +650,8 @@ class TransformerBlock(nn.Module):
         self.engram_device = None
         self.timer = timer
         if layer_id in engram_cfg.layer_ids:
-            #self.engram = Engram(layer_id=layer_id, timer=timer)
-            #self.engram_host = Engram_host(layer_id=layer_id, timer=timer,np_state=self.engram.np_state,tch_state=self.engram.tch_state)
-            #self.engram_device = Engram_device(layer_id=layer_id, timer=timer,np_state=self.engram.np_state,tch_state=self.engram.tch_state)
-            #print(f"参数是否相同: {torch.allclose(self.engram.value_proj.weight, self.engram_host.value_proj.weight)}")
-            #print(f"参数是否相同: {torch.allclose(self.engram.value_proj.weight, self.engram_device.value_proj.weight)}")
             self.engram_host = Engram_host(layer_id=layer_id, timer=timer)
-            self.engram_device = Engram_device(layer_id=layer_id, timer=timer,np_state=self.engram_host.np_state,tch_state=self.engram_host.tch_state)
-            print(f"参数是否相同: {torch.allclose(self.engram_host.value_proj.weight, self.engram_device.value_proj.weight)}")
+            self.engram_device = Engram_device(layer_id=layer_id, timer=timer)
 
     def forward(self,input_ids,hidden_states, profile_engram=False):
         if self.engram_host is not None and self.engram_device is not None:
