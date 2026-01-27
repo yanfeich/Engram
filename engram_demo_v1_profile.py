@@ -71,8 +71,9 @@ linear_device = torch.device("cpu") # "cpu" "hpu"
 conv_device = torch.device("hpu")
 layers_device = torch.device("hpu")
 
-torch.manual_seed(102)
-np.random.seed(102)
+random_seed = 102
+torch.manual_seed(random_seed)
+np.random.seed(random_seed)
 
 class StepTimer:
     def __init__(self):
@@ -132,7 +133,6 @@ class EngramConfig:
     kernel_size: int = 4
 '''
 
-# 1-layer Engram for profile
 @dataclass
 class EngramConfig:
     tokenizer_name_or_path: str = "/mnt/disk8/hf_models/DeepSeek-V3"
@@ -144,7 +144,8 @@ class EngramConfig:
 
 
     # original config 0.662B
-    layer_ids: List[int] = field(default_factory=lambda: [1])
+    layer_ids: List[int] = field(default_factory=lambda: [1,15])
+    #layer_ids: List[int] = field(default_factory=lambda: [1])
     engram_vocab_size: List[int] = field(default_factory=lambda: [129280*5, 129280*5])
     n_embed_per_ngram: int = 512
 
@@ -167,7 +168,7 @@ class BackBoneConfig:
     hidden_size: int = 1024
     hc_mult: int = 4
     vocab_size: int = 129280
-    num_layers: int = 4 # 30
+    num_layers: int = 30 # 30
     
 engram_cfg = EngramConfig()
 backbone_config = BackBoneConfig()
@@ -548,6 +549,8 @@ class Engram(nn.Module):
 class Engram_host(nn.Module):
     def __init__(self, layer_id,timer):
         super().__init__()
+        torch.manual_seed(random_seed+layer_id)
+        np.random.seed(random_seed+layer_id)
         self.timer = timer
         self.layer_id = layer_id
 
@@ -602,6 +605,8 @@ class Engram_host(nn.Module):
 class Engram_device(nn.Module):
     def __init__(self, layer_id,timer):
         super().__init__()
+        torch.manual_seed(random_seed+layer_id)
+        np.random.seed(random_seed+layer_id)
         self.timer = timer
         self.layer_id = layer_id
 
@@ -643,8 +648,8 @@ class Embedding(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self,layer_id,timer):
         super().__init__()
-        self.attn = lambda x:x
-        self.moe  = lambda x:x
+        self.attn = lambda x:x*0.3
+        self.moe  = lambda x:x*0.3
         #self.engram = None
         self.engram_host = None
         self.engram_device = None
@@ -661,9 +666,9 @@ class TransformerBlock(nn.Module):
             value, normed_keys = self.engram_host(input_ids=input_ids)
             with self.timer.measure("engram_hpu_graph_wrapper"):
                 hidden_states = self.engram_device(hidden_states, value, normed_keys) + hidden_states
-        hidden_states = hidden_states.to(layers_device)
         hidden_states = self.attn(hidden_states) + hidden_states
         hidden_states = self.moe(hidden_states) + hidden_states
+        htcore.mark_step()
         return hidden_states
 
 class LLM(nn.Module):
@@ -739,6 +744,7 @@ if __name__ == '__main__':
             input_ids_local = input_ids + i
             output, _ =  llm(input_ids_local)
             htcore.mark_step()
+    print(f"**************************************\n")
 
     loop_iters = 1000
     output=None
@@ -751,7 +757,6 @@ if __name__ == '__main__':
             htcore.mark_step()
     end_time = time.perf_counter()
     execution_time = (end_time - start_time) * 1000 / loop_iters
-    print(f"**************************************\n")
     print(output)
     print(f"Inference {torch.get_default_dtype()} Time: {execution_time} ms per loop")
 
@@ -793,3 +798,4 @@ if __name__ == '__main__':
                 profiler.step()
     trace_file = get_latest_trace_file(log_dir="./profile_logs")
     print(f"\nForward Complete with Profiling!\nTrace file saved at: {trace_file}")
+
