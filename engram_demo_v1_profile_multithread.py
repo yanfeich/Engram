@@ -52,26 +52,9 @@ import habana_frameworks.torch.core as htcore
 from habana_frameworks.torch.hpu import wrap_in_hpu_graph
 from transformers import AutoTokenizer
 from tokenizers import normalizers, Regex
-'''
-emb_device = torch.device("cpu")
-hash_emb_device = torch.device("cpu")
-linear_device = torch.device("cpu")
-conv_device = torch.device("cpu")
-layers_device = torch.device("cpu")
-'''
-'''
-emb_device = torch.device("hpu")
-hash_emb_device = torch.device("cpu")
-linear_device = torch.device("hpu") # "cpu" "hpu"
-conv_device = torch.device("hpu")
-layers_device = torch.device("hpu")
-'''
 
-emb_device = torch.device("hpu")
-hash_emb_device = torch.device("cpu")
-linear_device = torch.device("cpu") # "cpu" "hpu"
-conv_device = torch.device("hpu")
-layers_device = torch.device("hpu")
+cpu_device = torch.device("cpu")
+hpu_device = torch.device("hpu")
 
 random_seed = 102
 torch.manual_seed(random_seed)
@@ -147,8 +130,8 @@ class EngramConfig:
 
 
     # original config 0.662B
-    layer_ids: List[int] = field(default_factory=lambda: [1])
-    #layer_ids: List[int] = field(default_factory=lambda: [1,15])
+    #layer_ids: List[int] = field(default_factory=lambda: [1])
+    layer_ids: List[int] = field(default_factory=lambda: [1,15])
     engram_vocab_size: List[int] = field(default_factory=lambda: [129280*5, 129280*5])
     n_embed_per_ngram: int = 512
 
@@ -263,10 +246,10 @@ class ShortConv(nn.Module):
             bias=False,
             padding=(kernel_size - 1) * dilation,
             dilation=dilation,
-        ).to(conv_device)
+        ).to(hpu_device)
 
         self.norms = nn.ModuleList([
-            nn.RMSNorm(hidden_size, eps=norm_eps).to(conv_device)
+            nn.RMSNorm(hidden_size, eps=norm_eps).to(hpu_device)
             for _ in range(hc_mult)
         ])
         
@@ -466,11 +449,11 @@ class Engram_host(nn.Module):
             D = engram_cfg.n_embed_per_ngram // engram_cfg.n_head_per_ngram,
         )
         engram_hidden_size = (engram_cfg.max_ngram_size-1) * engram_cfg.n_embed_per_ngram
-        self.value_proj = nn.Linear(engram_hidden_size,backbone_config.hidden_size).to(linear_device)
+        self.value_proj = nn.Linear(engram_hidden_size,backbone_config.hidden_size).to(cpu_device)
         self.key_projs = nn.ModuleList(
-            [nn.Linear(engram_hidden_size, backbone_config.hidden_size).to(linear_device) for _ in range(backbone_config.hc_mult)]
+            [nn.Linear(engram_hidden_size, backbone_config.hidden_size).to(cpu_device) for _ in range(backbone_config.hc_mult)]
         )
-        self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(linear_device) for _ in range(backbone_config.hc_mult)])
+        self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(cpu_device) for _ in range(backbone_config.hc_mult)])
 
         self.engram_outputs = {}
     
@@ -484,7 +467,7 @@ class Engram_host(nn.Module):
         # ***** This is a device boundary *****
         hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids,self.layer_id))
         embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-        embeddings=embeddings.to(linear_device)
+        embeddings=embeddings.to(cpu_device)
 
         # ***** Either This is a device boundary *****
         value = self.value_proj(embeddings).unsqueeze(2)
@@ -502,10 +485,10 @@ class Engram_host(nn.Module):
         hidden_states: [B, L, HC_MULT, D]
         input_ids: [B, L]
         """
-        input_ids = input_ids.to(hash_emb_device)
+        input_ids = input_ids.to(cpu_device)
         hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
         embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-        embeddings=embeddings.to(linear_device)
+        embeddings=embeddings.to(cpu_device)
 
         gates = []
         for hc_idx in range(backbone_config.hc_mult):
@@ -520,24 +503,24 @@ class Engram_host(nn.Module):
         gates = torch.stack(gates,dim=2)
         value = gates * self.value_proj(embeddings).unsqueeze(2)
         output = value + self.short_conv(value)
-        output = output.to(layers_device)
+        output = output.to(hpu_device)
         return output
 
     def manual_profile(self,hidden_states,input_ids):
         with self.timer.measure("input_ids.to            "):
-            input_ids = input_ids.to(hash_emb_device)
+            input_ids = input_ids.to(cpu_device)
         with self.timer.measure("hash_mapping.hash       "):
             hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
         with self.timer.measure("multi_head_embedding    "):
             embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
         with self.timer.measure("embeddings.to           "):
-            embeddings=embeddings.to(linear_device)
-        hidden_states = hidden_states.to(conv_device)
+            embeddings=embeddings.to(cpu_device)
+        hidden_states = hidden_states.to(hpu_device)
 
         with self.timer.measure("value_proj              "):
             value = self.value_proj(embeddings).unsqueeze(2)
         with self.timer.measure("value_proj.to           "):
-            value = value.to(conv_device)
+            value = value.to(hpu_device)
 
         normed_keys = []
         with self.timer.measure("key_projs               "):
@@ -547,7 +530,7 @@ class Engram_host(nn.Module):
                 normed_keys.append(normed_key)
             normed_keys = torch.stack(normed_keys)
         with self.timer.measure("normed_keys.to          "):
-            normed_keys = normed_keys.to(conv_device)
+            normed_keys = normed_keys.to(hpu_device)
 
         gates = []
         with self.timer.measure("scaled_dot_product_gates"):
@@ -580,7 +563,7 @@ class Engram_device(nn.Module):
             dilation    = engram_cfg.max_ngram_size,
             hc_mult     = backbone_config.hc_mult,
         )
-        self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(conv_device) for _ in range(backbone_config.hc_mult)])
+        self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(hpu_device) for _ in range(backbone_config.hc_mult)])
     
     def forward(self,hidden_states, value, normed_keys):
         gates = []
@@ -600,8 +583,8 @@ class Engram_device(nn.Module):
 class Embedding(nn.Module):
     def __init__(self,vocab_size,hidden_size):
         super().__init__()
-        self.Embedding = nn.Embedding(vocab_size,hidden_size).to(emb_device)
-        # self.Fake_proj = nn.Linear(hidden_size,hidden_size).to(emb_device)
+        self.Embedding = nn.Embedding(vocab_size,hidden_size).to(hpu_device)
+        # self.Fake_proj = nn.Linear(hidden_size,hidden_size).to(hpu_device)
 
     def forward(self,input_ids):
         hidden_states = self.Embedding(input_ids)
@@ -645,7 +628,7 @@ class TransformerBlockWithEngram(TransformerBlock):
             hidden_states = self.engram(hidden_states, value, normed_keys) + hidden_states
             #print(f"[Engram Layer {self.layer_id}] engram_out:{engram_out} hidden_states:{hidden_states}")
         #print(f"  engram done. hidden_states:{hidden_states}")
-        hidden_states = hidden_states.to(layers_device)
+        hidden_states = hidden_states.to(hpu_device)
         hidden_states = self.attn(hidden_states) + hidden_states
         hidden_states = self.moe(hidden_states) + hidden_states
         #print(f"[TransformerBlock Layer {self.layer_id}] hidden_states:{hidden_states}")
@@ -663,7 +646,7 @@ class EngramManager:
         )
         
         self.threads = {}
-        self.results: Dict[int, Tuple[Any, Any, Any]] = {layer_id: (None, None, None) for layer_id in self.layer_ids}
+        self.results: Dict[int, Tuple[Any, Any]] = {layer_id: (None, None) for layer_id in self.layer_ids}
 
     def _compute_layer(self, layer_id, input_ids):
         layer = self.engram_layers_host[self.layer_ids.index(layer_id)]
@@ -671,12 +654,14 @@ class EngramManager:
         value, normed_keys = layer(input_ids=input_ids)
         value = value.to("hpu", non_blocking=True)
         normed_keys = normed_keys.to("hpu", non_blocking=True)
-        event = torch.hpu.Event()
-        torch.hpu.current_stream().record_event(event)
-        
-        self.results[layer_id] = (value, normed_keys, event)
+       
+        self.results[layer_id] = (value, normed_keys)
 
     def start_async_computation(self, input_ids):
+        '''
+        # Synchronous version for reference
+        for layer_id in self.layer_ids:
+            self._compute_layer(layer_id, input_ids)
         '''
         self.threads.clear()
         for layer_id in self.layer_ids:
@@ -687,27 +672,17 @@ class EngramManager:
             )
             self.threads[layer_id] = thread
             thread.start()
-            #print(f"!!!!! started thread for layer {layer_id} !!!!!")
-        '''
-        for layer_id in self.layer_ids:
-            self._compute_layer(layer_id, input_ids)
 
     def get_engram_output(self, layer_id):
-        if layer_id not in self.layer_ids:
-            return None, None
-        '''
-        if layer_id in self.threads:
-            self.threads[layer_id].join(timeout=10.0)
-        thread = self.threads.get(layer_id, None)
-        #print(f"!!!!! {layer_id} join done")
-        if thread is not None and thread.is_alive():
-            print(f"!!!!! thread is alive for {layer_id}, after join... !!!!!")
-        '''
-        #print(f"--- get_engram_output waiting for layer {layer_id} threads done ---")
-        value, normed_keys, event = self.results[layer_id]
+        assert layer_id in self.layer_ids, f"Layer ID {layer_id} not in Engram layers {self.layer_ids}"
+        assert layer_id in self.threads, f"Layer ID {layer_id} not in Engram threads {self.layer_ids}"
+
+        self.threads[layer_id].join(timeout=1.0)
+        value, normed_keys = self.results[layer_id]
+        event = torch.hpu.Event()
+        torch.hpu.current_stream().record_event(event)
         event.synchronize()
         
-        #print(f"--- get_engram_output waiting for layer {layer_id} synchronize done ---")
         return value, normed_keys
 
 class LLM(nn.Module):
@@ -724,11 +699,12 @@ class LLM(nn.Module):
                 for layer_id in range(backbone_config.num_layers)
             ]
         )
-        #self.lm_head = nn.Linear(backbone_config.hidden_size, backbone_config.vocab_size).to(layers_device)
+        #self.lm_head = nn.Linear(backbone_config.hidden_size, backbone_config.vocab_size).to(hpu_device)
 
     def forward(self, input_ids, profile_engram=False):
         #print(f"------ in LLM forward ------")
-        input_ids_host = input_ids.to(hash_emb_device)
+        input_ids_host = input_ids.to(cpu_device)
+        #htcore.hpu.synchronize()
         self.engram_manager.start_async_computation(input_ids_host)
 
         hidden_states = self.vocab_embed_tokens(input_ids)
@@ -772,9 +748,7 @@ if __name__ == '__main__':
     #input_b, input_seq = 1, 1
     input_b, input_seq = int(args.batch_size), int(args.seq_len)
     input_ids = torch.randint(0, 127000, size=(input_b, input_seq), dtype=torch.long)
-
-    input_ids = input_ids.to("hpu")  # in case all CPU that mark_step fails
-    input_ids = input_ids.to(emb_device)
+    input_ids = input_ids.to(hpu_device)
 
     B,L = input_ids.shape
     print(f"\n******** Engram Configuration ********")
