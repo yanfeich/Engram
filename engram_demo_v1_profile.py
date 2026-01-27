@@ -35,7 +35,7 @@ from contextlib import contextmanager
 from typing import Dict
 
 ## built-in
-from typing import List
+from typing import List, Tuple, Any
 from dataclasses import dataclass, field
 import math
 
@@ -411,12 +411,10 @@ class NgramHashMapping:
         
         return np.stack(all_hashes, axis=2)
 
-    def hash(self, input_ids):
+    def hash(self, input_ids, layer_id):
         input_ids = self.compressed_tokenizer(input_ids)
-        hash_ids_for_all_layers = {}
-        for layer_id in self.layer_ids:
-            hash_ids_for_all_layers[layer_id] = self._get_ngram_hashes(input_ids, layer_id=layer_id)
-        return hash_ids_for_all_layers
+        hash_ids_for_one_layer = self._get_ngram_hashes(input_ids, layer_id=layer_id)
+        return hash_ids_for_one_layer
 
 class MultiHeadEmbedding(nn.Module):
     def __init__(self, list_of_N: List[int], D: int):
@@ -440,10 +438,18 @@ class MultiHeadEmbedding(nn.Module):
         return output
     
 class Engram(nn.Module):
-    def __init__(self, layer_id,timer):
+    def __init__(self, layer_id,timer,np_state=None,tch_state=None):
         super().__init__()
         self.timer = timer
         self.layer_id = layer_id
+        if np_state is None:
+            self.np_state = np.random.get_state()
+        else:
+            np.random.set_state(np_state)
+        if tch_state is None:
+            self.tch_state = torch.get_rng_state()
+        else:
+            torch.set_rng_state(tch_state)
         self.hash_mapping = NgramHashMapping(
             engram_vocab_size=engram_cfg.engram_vocab_size,
             max_ngram_size = engram_cfg.max_ngram_size,
@@ -474,13 +480,13 @@ class Engram(nn.Module):
     
         print(f"[Engram]: multi_head_embedding[{layer_id}]: num_embeddings={self.multi_head_embedding.mhe_embedding.num_embeddings}, embedding_dim={self.multi_head_embedding.mhe_embedding.embedding_dim}, params={human_format(self.multi_head_embedding.mhe_embedding.num_embeddings*self.multi_head_embedding.mhe_embedding.embedding_dim)}")
 
-    def forward(self,hidden_states,input_ids):
+    def forward_ref(self,hidden_states,input_ids):
         """
         hidden_states: [B, L, HC_MULT, D]
         input_ids: [B, L]
         """
         input_ids = input_ids.to(hash_emb_device)
-        hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
+        hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids, self.layer_id))
         embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
         embeddings=embeddings.to(linear_device)
 
@@ -500,50 +506,11 @@ class Engram(nn.Module):
         output = output.to(layers_device)
         return output
 
-    def forward_cpu(self,input_ids):
-        """
-        hidden_states: [B, L, HC_MULT, D]
-        input_ids: [B, L]
-        """
-        # ***** This is a device boundary *****
-        input_ids = input_ids.to(hash_emb_device)
-        hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
-        embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-        embeddings=embeddings.to(linear_device)
-
-        # ***** Either This is a device boundary *****
-        value = self.value_proj(embeddings).unsqueeze(2)
-        normed_keys = []
-        for hc_idx in range(backbone_config.hc_mult):
-            key = self.key_projs[hc_idx](embeddings)
-            # norm1 可以在 CPU / HPU 上做, 也需要适当 norm1.to(device)
-            normed_key = self.norm1[hc_idx](key)
-            normed_keys.append(normed_key)
-        normed_keys = torch.stack(normed_keys)
-        value=value.to(conv_device)
-        normed_keys=normed_keys.to(conv_device)
-
-        return value, normed_keys
-
-    def forward_hpu(self,hidden_states, value, normed_keys):
-        gates = []
-        for hc_idx in range(backbone_config.hc_mult):
-            query = hidden_states[:,:,hc_idx,:]
-            normed_query = self.norm2[hc_idx](query)
-            gate = (normed_keys[hc_idx] * normed_query).sum(dim=-1) / math.sqrt(backbone_config.hidden_size)
-            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-            gate = gate.sigmoid().unsqueeze(-1)
-            gates.append(gate)
-        gates = torch.stack(gates,dim=2)
-        value = gates * value
-        output = value + self.short_conv(value)
-        return output
-
     def manual_profile(self,hidden_states,input_ids):
         with self.timer.measure("input_ids.to            "):
             input_ids = input_ids.to(hash_emb_device)
         with self.timer.measure("hash_mapping.hash       "):
-            hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
+            hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids, self.layer_id))
         with self.timer.measure("multi_head_embedding    "):
             embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
         with self.timer.measure("embeddings.to           "):
@@ -582,14 +549,54 @@ class Engram(nn.Module):
 
         return output
 
-class EngramHPUWrapper(nn.Module):
-    def __init__(self, engram_instance):
-        super().__init__()
-        self.engram = engram_instance
-        
-    def forward(self, *args, **kwargs):
-        return self.engram.forward_hpu(*args, **kwargs)
-    
+class Engram_host(Engram):
+    def __init__(self, layer_id,timer,np_state=None,tch_state=None):
+        super().__init__(layer_id,timer,np_state,tch_state)
+
+    def forward(self,input_ids):
+        """
+        hidden_states: [B, L, HC_MULT, D]
+        input_ids: [B, L]
+        """
+        # ***** This is a device boundary *****
+        input_ids = input_ids.to(hash_emb_device)
+        hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids, self.layer_id))
+        embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
+        embeddings=embeddings.to(linear_device)
+
+        # ***** Either This is a device boundary *****
+        value = self.value_proj(embeddings).unsqueeze(2)
+        normed_keys = []
+        for hc_idx in range(backbone_config.hc_mult):
+            key = self.key_projs[hc_idx](embeddings)
+            # norm1 可以在 CPU / HPU 上做, 也需要适当 norm1.to(device)
+            normed_key = self.norm1[hc_idx](key)
+            normed_keys.append(normed_key)
+        normed_keys = torch.stack(normed_keys)
+        value=value.to(conv_device)
+        normed_keys=normed_keys.to(conv_device)
+
+        return value, normed_keys
+
+class Engram_device(Engram):
+    def __init__(self, layer_id,timer,np_state=None,tch_state=None):
+        super().__init__(layer_id,timer,np_state,tch_state)
+
+    def forward(self,hidden_states, value, normed_keys):
+        gates = []
+        for hc_idx in range(backbone_config.hc_mult):
+            query = hidden_states[:,:,hc_idx,:]
+            normed_query = self.norm2[hc_idx](query)
+            gate = (normed_keys[hc_idx] * normed_query).sum(dim=-1) / math.sqrt(backbone_config.hidden_size)
+            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+            gate = gate.sigmoid().unsqueeze(-1)
+            gates.append(gate)
+        gates = torch.stack(gates,dim=2)
+        value = gates * value
+        output = value + self.short_conv(value)
+        return output
+
+
 class Embedding(nn.Module):
     def __init__(self,vocab_size,hidden_size):
         super().__init__()
@@ -606,25 +613,28 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.attn = lambda x:x
         self.moe  = lambda x:x
-        self.engram = None
+        #self.engram = None
+        self.engram_host = None
+        self.engram_device = None
         self.timer = timer
         if layer_id in engram_cfg.layer_ids:
-            self.engram = Engram(layer_id=layer_id, timer=timer)
+            #self.engram = Engram(layer_id=layer_id, timer=timer)
+            #self.engram_host = Engram_host(layer_id=layer_id, timer=timer,np_state=self.engram.np_state,tch_state=self.engram.tch_state)
+            #self.engram_device = Engram_device(layer_id=layer_id, timer=timer,np_state=self.engram.np_state,tch_state=self.engram.tch_state)
+            #print(f"参数是否相同: {torch.allclose(self.engram.value_proj.weight, self.engram_host.value_proj.weight)}")
+            #print(f"参数是否相同: {torch.allclose(self.engram.value_proj.weight, self.engram_device.value_proj.weight)}")
+            self.engram_host = Engram_host(layer_id=layer_id, timer=timer)
+            self.engram_device = Engram_device(layer_id=layer_id, timer=timer,np_state=self.engram_host.np_state,tch_state=self.engram_host.tch_state)
+            print(f"参数是否相同: {torch.allclose(self.engram_host.value_proj.weight, self.engram_device.value_proj.weight)}")
 
-            engram_wrapper = EngramHPUWrapper(self.engram)
-            self._engram_hpu_graph_wrapper = wrap_in_hpu_graph(engram_wrapper)
-    
     def forward(self,input_ids,hidden_states, profile_engram=False):
-        if self.engram is not None:
-            if not profile_engram:
-                '''
-                hidden_states = self.engram(hidden_states=hidden_states,input_ids=input_ids) + hidden_states
-                '''
-                value, normed_keys = self.engram.forward_cpu(input_ids=input_ids)
-                with self.timer.measure("engram_hpu_graph_wrapper"):
-                    hidden_states = self._engram_hpu_graph_wrapper(hidden_states, value, normed_keys) + hidden_states
-            else:
-                hidden_states = self.engram.manual_profile(hidden_states=hidden_states,input_ids=input_ids) + hidden_states
+        if self.engram_host is not None and self.engram_device is not None:
+            '''
+            hidden_states = self.engram(hidden_states=hidden_states,input_ids=input_ids) + hidden_states
+            '''
+            value, normed_keys = self.engram_host(input_ids=input_ids)
+            with self.timer.measure("engram_hpu_graph_wrapper"):
+                hidden_states = self.engram_device(hidden_states, value, normed_keys) + hidden_states
         hidden_states = hidden_states.to(layers_device)
         hidden_states = self.attn(hidden_states) + hidden_states
         hidden_states = self.moe(hidden_states) + hidden_states
