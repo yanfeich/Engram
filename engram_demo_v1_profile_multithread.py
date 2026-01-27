@@ -73,8 +73,9 @@ linear_device = torch.device("cpu") # "cpu" "hpu"
 conv_device = torch.device("hpu")
 layers_device = torch.device("hpu")
 
-torch.manual_seed(102)
-np.random.seed(102)
+random_seed = 102
+torch.manual_seed(random_seed)
+np.random.seed(random_seed)
 
 class StepTimer:
     def __init__(self):
@@ -170,7 +171,7 @@ class BackBoneConfig:
     hidden_size: int = 1024
     hc_mult: int = 4
     vocab_size: int = 129280
-    num_layers: int = 4 # 30
+    num_layers: int = 30 # 30
     
 engram_cfg = EngramConfig()
 backbone_config = BackBoneConfig()
@@ -446,6 +447,8 @@ class MultiHeadEmbedding(nn.Module):
 class Engram_host(nn.Module):
     def __init__(self, layer_id,timer):
         super().__init__()
+        torch.manual_seed(random_seed+layer_id)
+        np.random.seed(random_seed+layer_id)
         self.timer = timer
         self.layer_id = layer_id
         self.hash_mapping = NgramHashMapping(
@@ -566,23 +569,18 @@ class Engram_host(nn.Module):
 class Engram_device(nn.Module):
     def __init__(self, layer_id,timer):
         super().__init__()
+        torch.manual_seed(random_seed+layer_id)
+        np.random.seed(random_seed+layer_id)
         self.timer = timer
         self.layer_id = layer_id
-        '''
-        engram_hidden_size = (engram_cfg.max_ngram_size-1) * engram_cfg.n_embed_per_ngram
-        self.value_proj = nn.Linear(engram_hidden_size,backbone_config.hidden_size).to(linear_device)
-        self.key_projs = nn.ModuleList(
-            [nn.Linear(engram_hidden_size, backbone_config.hidden_size).to(linear_device) for _ in range(backbone_config.hc_mult)]
-        )
-        self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(linear_device) for _ in range(backbone_config.hc_mult)])
-        '''
-        self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(conv_device) for _ in range(backbone_config.hc_mult)])
+
         self.short_conv = ShortConv(
             hidden_size = backbone_config.hidden_size,
             kernel_size = engram_cfg.kernel_size,
             dilation    = engram_cfg.max_ngram_size,
             hc_mult     = backbone_config.hc_mult,
         )
+        self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(conv_device) for _ in range(backbone_config.hc_mult)])
     
     def forward(self,hidden_states, value, normed_keys):
         gates = []
@@ -613,8 +611,8 @@ class Embedding(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self,layer_id,timer):
         super().__init__()
-        self.attn = lambda x:x
-        self.moe  = lambda x:x
+        self.attn = lambda x:x*0.3
+        self.moe  = lambda x:x*0.3
         self.layer_id = layer_id
         self.timer = timer
         #self.engram = None
@@ -629,6 +627,7 @@ class TransformerBlock(nn.Module):
         hidden_states = self.moe(hidden_states) + hidden_states
         #print(f"  TransformerBlock done. hidden_states:{hidden_states}")
         htcore.mark_step()
+        #print(f"[TransformerBlock Layer {self.layer_id}] hidden_states:{hidden_states}")
         return hidden_states
 
 class TransformerBlockWithEngram(TransformerBlock):
@@ -644,11 +643,12 @@ class TransformerBlockWithEngram(TransformerBlock):
                 self.layer_id,
             )
             hidden_states = self.engram(hidden_states, value, normed_keys) + hidden_states
+            #print(f"[Engram Layer {self.layer_id}] engram_out:{engram_out} hidden_states:{hidden_states}")
         #print(f"  engram done. hidden_states:{hidden_states}")
         hidden_states = hidden_states.to(layers_device)
         hidden_states = self.attn(hidden_states) + hidden_states
         hidden_states = self.moe(hidden_states) + hidden_states
-        #print(f"  TransformerBlockWithEngram done. hidden_states:{hidden_states}")
+        #print(f"[TransformerBlock Layer {self.layer_id}] hidden_states:{hidden_states}")
         return hidden_states
 
 class EngramManager:
@@ -795,6 +795,7 @@ if __name__ == '__main__':
             input_ids_local = input_ids + i
             output, _ =  llm(input_ids_local)
             htcore.mark_step()
+    print(f"**************************************\n")
 
     loop_iters = 1000
     output=None
@@ -807,7 +808,6 @@ if __name__ == '__main__':
             htcore.mark_step()
     end_time = time.perf_counter()
     execution_time = (end_time - start_time) * 1000 / loop_iters
-    print(f"**************************************\n")
     print(output)
     print(f"Inference {torch.get_default_dtype()} Time: {execution_time} ms per loop")
 
@@ -833,19 +833,10 @@ if __name__ == '__main__':
     ) as profiler:
         with torch.no_grad():
             for i in range(int(10)):
-                '''
-                hidden_states = embed_tokens(input_ids)
-                ## mock hyper-connection
-                hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_config.hc_mult, -1)
-                for layer in decoder_layers:
-                    hidden_states = layer(input_ids=input_ids,hidden_states=hidden_states)
-                ## mock hyper-connection
-                hidden_states = hidden_states[:,:,0,:] 
-                output = lm_head(hidden_states)
-                '''
                 output, _ =  llm(input_ids)
                 htcore.mark_step()
                 htcore.hpu.synchronize()
                 profiler.step()
     trace_file = get_latest_trace_file(log_dir="./profile_logs")
     print(f"\nForward Complete with Profiling!\nTrace file saved at: {trace_file}")
+
