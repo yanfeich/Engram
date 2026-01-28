@@ -131,7 +131,8 @@ class EngramConfig:
 
     # original config 0.662B
     #layer_ids: List[int] = field(default_factory=lambda: [1])
-    layer_ids: List[int] = field(default_factory=lambda: [1,15])
+    #layer_ids: List[int] = field(default_factory=lambda: [1,15])
+    layer_ids: List[int] = field(default_factory=lambda: [1,3])
     engram_vocab_size: List[int] = field(default_factory=lambda: [129280*5, 129280*5])
     n_embed_per_ngram: int = 512
 
@@ -154,7 +155,7 @@ class BackBoneConfig:
     hidden_size: int = 1024
     hc_mult: int = 4
     vocab_size: int = 129280
-    num_layers: int = 30 # 30
+    num_layers: int = 5 # 30
     
 engram_cfg = EngramConfig()
 backbone_config = BackBoneConfig()
@@ -468,6 +469,7 @@ class Engram_host(nn.Module):
         hidden_states: [B, L, HC_MULT, D]
         input_ids: [B, L]
         """
+        #print(f"[Engram_host Layer {self.layer_id}] starts...")
         with self.timer.measure("host time       "):
             '''
             value = self.fake_value
@@ -485,6 +487,7 @@ class Engram_host(nn.Module):
                 normed_key = self.norm1[hc_idx](key)
                 normed_keys.append(normed_key)
             normed_keys = torch.stack(normed_keys)
+        #print(f"[Engram_host Layer {self.layer_id}] done.")
         return value, normed_keys
 
     def forward_ref(self,hidden_states,input_ids):
@@ -600,6 +603,7 @@ class Embedding(nn.Module):
         # hidden_states = self.Fake_proj(hidden_states)
         return hidden_states
 
+@wrap_in_hpu_graph
 class TransformerBlock(nn.Module):
     def __init__(self,layer_id,timer):
         super().__init__()
@@ -607,39 +611,35 @@ class TransformerBlock(nn.Module):
         self.moe  = lambda x:x*0.3
         self.layer_id = layer_id
         self.timer = timer
-        #self.engram = None
-        #if layer_id in engram_cfg.layer_ids:
-        #    self.engram = Engram(layer_id=layer_id, timer=timer)
-        #    engram_wrapper = EngramHPUWrapper(self.engram)
-        #    self._engram_hpu_graph_wrapper = wrap_in_hpu_graph(engram_wrapper)
+        self.Fake_proj = nn.Linear(backbone_config.hidden_size,backbone_config.hidden_size).to(hpu_device)
     
     def forward(self, hidden_states):
         #print(f"--- in TransformerBlock forward {self.layer_id} ---")
         hidden_states = self.attn(hidden_states) + hidden_states
+        for _ in range(1000):
+            hidden_states = self.Fake_proj(hidden_states)
         hidden_states = self.moe(hidden_states) + hidden_states
         #print(f"  TransformerBlock done. hidden_states:{hidden_states}")
         htcore.mark_step()
         #print(f"[TransformerBlock Layer {self.layer_id}] hidden_states:{hidden_states}")
         return hidden_states
 
+#@wrap_in_hpu_graph
 class TransformerBlockWithEngram(TransformerBlock):
     def __init__(self,layer_id,timer,engram_manager):
         super().__init__(layer_id,timer)
         self.engram_manager = engram_manager
-        self.engram = Engram_device(layer_id=layer_id,timer=timer)
+        self.engram_device = Engram_device(layer_id=layer_id,timer=timer)
     
     def forward(self, hidden_states):
         #print(f"--- in TransformerBlockWithEngram forward {self.layer_id} ---")
         with self.timer.measure("engram_hpu_graph_wrapper"):
-            value, normed_keys = self.engram_manager.get_engram_output(
-                self.layer_id,
-            )
-            hidden_states = self.engram(hidden_states, value, normed_keys) + hidden_states
+            value, normed_keys = self.engram_manager.get_engram_output(self.layer_id)
+            hidden_states = self.engram_device(hidden_states, value, normed_keys) + hidden_states
             #print(f"[Engram Layer {self.layer_id}] engram_out:{engram_out} hidden_states:{hidden_states}")
-        #print(f"  engram done. hidden_states:{hidden_states}")
-        hidden_states = hidden_states.to(hpu_device)
         hidden_states = self.attn(hidden_states) + hidden_states
         hidden_states = self.moe(hidden_states) + hidden_states
+        htcore.mark_step()
         #print(f"[TransformerBlock Layer {self.layer_id}] hidden_states:{hidden_states}")
         return hidden_states
 
@@ -647,54 +647,58 @@ class EngramManager:
     def __init__(self, layer_ids, timer):
         self.layer_ids = layer_ids
         self.timer = timer
-        self.engram_layers_host = nn.ModuleList(
+        self.engram_host_layer = nn.ModuleList(
             [Engram_host(layer_id=layer_id,timer=self.timer) for layer_id in self.layer_ids]
         )
         
-        self.threads = {}
-        self.results: Dict[int, Tuple[Any, Any, Any]] = {layer_id: (None, None, None) for layer_id in self.layer_ids}
+        self.threads: Dict[int, threading.Thread] = {}
+        self.results: Dict[int, Tuple[Any, Any]] = {layer_id: (None, None) for layer_id in self.layer_ids}
 
-    def _compute_layer(self, layer_id, input_ids):
-        layer = self.engram_layers_host[self.layer_ids.index(layer_id)]
+    def _compute_engram_host(self, layer_id, input_ids):
+        layer = self.engram_host_layer[self.layer_ids.index(layer_id)]
         
-        value, normed_keys = layer(input_ids=input_ids)
-       
-        self.results[layer_id] = (value, normed_keys, None)
+        with self.timer.measure(f"layer_{layer_id}_cpu_compute"):
+            value, normed_keys = layer(input_ids=input_ids)
+
+        value_hpu  = value.to("hpu")
+        normed_keys_hpu  = normed_keys.to("hpu")
+        '''
+        transfer_stream = ht.Stream()
+        with ht.stream(transfer_stream):
+            value_hpu  = value.to("hpu", non_blocking=True)
+            normed_keys_hpu  = normed_keys.to("hpu", non_blocking=True)
+        transfer_stream.synchronize()
+        '''
+
+        self.results[layer_id] = (value_hpu , normed_keys_hpu)
+        #print(f"[EngramManager] Layer {layer_id} computation done.")
 
     def start_async_computation(self, input_ids):
         '''
         # Synchronous version for reference
         for layer_id in self.layer_ids:
-            self._compute_layer(layer_id, input_ids)
+            self._compute_engram_host(layer_id, input_ids)
         '''
         self.threads.clear()
+        input_ids = input_ids.to(cpu_device)
         for layer_id in self.layer_ids:
             thread = threading.Thread(
-                target=self._compute_layer,
+                target=self._compute_engram_host,
                 args=(layer_id, input_ids),
                 daemon=True
             )
             self.threads[layer_id] = thread
             thread.start()
-        for layer_id in self.layer_ids:
-            self.threads[layer_id].join(timeout=1.0)
-            value, normed_keys, _ = self.results[layer_id]
-
-            value = value.to("hpu", non_blocking=True)
-            normed_keys = normed_keys.to("hpu", non_blocking=True)
-            htcore.mark_step()
-
-            event = torch.hpu.Event()
-            torch.hpu.current_stream().record_event(event)
-            self.results[layer_id] = (value, normed_keys, event)
 
     def get_engram_output(self, layer_id):
         assert layer_id in self.layer_ids, f"Layer ID {layer_id} not in Engram layers {self.layer_ids}"
         assert layer_id in self.threads, f"Layer ID {layer_id} not in Engram threads {self.layer_ids}"
+        if self.threads[layer_id].is_alive():
+            #print(f"[EngramManager] Waiting for Layer {layer_id} computation to complete...")
+            self.threads[layer_id].join(timeout=10.0)
 
-        value, normed_keys, event = self.results[layer_id]
-        event.synchronize()
-        
+        #print(f"[EngramManager] Layer {layer_id} get_engram_output called.")
+        value, normed_keys = self.results[layer_id]
         return value, normed_keys
 
 class LLM(nn.Module):
@@ -715,9 +719,8 @@ class LLM(nn.Module):
 
     def forward(self, input_ids, profile_engram=False):
         #print(f"------ in LLM forward ------")
-        input_ids_host = input_ids.to(cpu_device)
         #htcore.hpu.synchronize()
-        self.engram_manager.start_async_computation(input_ids_host)
+        self.engram_manager.start_async_computation(input_ids)
 
         hidden_states = self.vocab_embed_tokens(input_ids)
         ## mock hyper-connection
