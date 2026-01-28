@@ -612,6 +612,9 @@ class TransformerBlock(nn.Module):
         self.layer_id = layer_id
         self.timer = timer
         self.Fake_proj = nn.Linear(backbone_config.hidden_size,backbone_config.hidden_size).to(hpu_device)
+        with torch.no_grad():
+            self.Fake_proj.weight.copy_(torch.eye(backbone_config.hidden_size, backbone_config.hidden_size))
+            self.Fake_proj.bias.copy_(torch.zeros_like(self.Fake_proj.bias))
     
     def forward(self, hidden_states):
         #print(f"--- in TransformerBlock forward {self.layer_id} ---")
@@ -624,7 +627,6 @@ class TransformerBlock(nn.Module):
         #print(f"[TransformerBlock Layer {self.layer_id}] hidden_states:{hidden_states}")
         return hidden_states
 
-#@wrap_in_hpu_graph
 class TransformerBlockWithEngram(TransformerBlock):
     def __init__(self,layer_id,timer,engram_manager):
         super().__init__(layer_id,timer)
