@@ -605,12 +605,10 @@ class Embedding(nn.Module):
 
 @wrap_in_hpu_graph
 class TransformerBlock(nn.Module):
-    def __init__(self,layer_id,timer):
+    def __init__(self):
         super().__init__()
         self.attn = lambda x:x*0.3
         self.moe  = lambda x:x*0.3
-        self.layer_id = layer_id
-        self.timer = timer
         self.Fake_proj = nn.Linear(backbone_config.hidden_size,backbone_config.hidden_size).to(hpu_device)
         with torch.no_grad():
             self.Fake_proj.weight.copy_(torch.eye(backbone_config.hidden_size, backbone_config.hidden_size))
@@ -627,9 +625,11 @@ class TransformerBlock(nn.Module):
         #print(f"[TransformerBlock Layer {self.layer_id}] hidden_states:{hidden_states}")
         return hidden_states
 
-class TransformerBlockWithEngram(TransformerBlock):
+class GetEngram(nn.Module):
     def __init__(self,layer_id,timer,engram_manager):
-        super().__init__(layer_id,timer)
+        super().__init__()
+        self.timer = timer
+        self.layer_id = layer_id
         self.engram_manager = engram_manager
         self.engram_device = Engram_device(layer_id=layer_id,timer=timer)
     
@@ -639,10 +639,20 @@ class TransformerBlockWithEngram(TransformerBlock):
             value, normed_keys = self.engram_manager.get_engram_output(self.layer_id)
             hidden_states = self.engram_device(hidden_states, value, normed_keys) + hidden_states
             #print(f"[Engram Layer {self.layer_id}] engram_out:{engram_out} hidden_states:{hidden_states}")
-        hidden_states = self.attn(hidden_states) + hidden_states
-        hidden_states = self.moe(hidden_states) + hidden_states
-        htcore.mark_step()
         #print(f"[TransformerBlock Layer {self.layer_id}] hidden_states:{hidden_states}")
+        return hidden_states
+    
+class TransformerBlockWithEngram(TransformerBlock):
+    def __init__(self,layer_id,timer,engram_manager):
+        super().__init__()
+        self.engram_manager = engram_manager
+        self.engram_device = Engram_device(layer_id=layer_id,timer=timer)
+        self.get_engram = GetEngram(layer_id=layer_id,timer=timer,engram_manager=engram_manager)
+        self.transformer_block = TransformerBlock()
+    
+    def forward(self, hidden_states):
+        hidden_states = self.get_engram(hidden_states)
+        hidden_states = self.transformer_block(hidden_states)
         return hidden_states
 
 class EngramManager:
@@ -713,7 +723,7 @@ class LLM(nn.Module):
             [
                 TransformerBlockWithEngram(layer_id=layer_id, timer=self.timer, engram_manager=self.engram_manager)
                 if layer_id in engram_cfg.layer_ids
-                else TransformerBlock(layer_id=layer_id, timer=self.timer)
+                else TransformerBlock()
                 for layer_id in range(backbone_config.num_layers)
             ]
         )
