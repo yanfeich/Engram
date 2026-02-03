@@ -470,94 +470,19 @@ class Engram_host(nn.Module):
         input_ids: [B, L]
         """
         #print(f"[Engram_host Layer {self.layer_id}] starts...")
-        with self.timer.measure("host time       "):
-            '''
-            value = self.fake_value
-            normed_keys = self.fake_keys
-            '''
-            hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids,self.layer_id))
-            embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-            #embeddings=embeddings.to(cpu_device)
-
-            value = self.value_proj(embeddings).unsqueeze(2)
-            normed_keys = []
-            for hc_idx in range(backbone_config.hc_mult):
-                key = self.key_projs[hc_idx](embeddings)
-                # norm1 可以在 CPU / HPU 上做, 也需要适当 norm1.to(device)
-                normed_key = self.norm1[hc_idx](key)
-                normed_keys.append(normed_key)
-            normed_keys = torch.stack(normed_keys)
-        #print(f"[Engram_host Layer {self.layer_id}] done.")
-        return value, normed_keys
-
-    def forward_ref(self,hidden_states,input_ids):
-        """
-        hidden_states: [B, L, HC_MULT, D]
-        input_ids: [B, L]
-        """
-        input_ids = input_ids.to(cpu_device)
-        hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
+        hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids,self.layer_id))
         embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-        embeddings=embeddings.to(cpu_device)
-
-        gates = []
+        #embeddings=embeddings.to(cpu_device)
+        value = self.value_proj(embeddings).unsqueeze(2)
+        normed_keys = []
         for hc_idx in range(backbone_config.hc_mult):
             key = self.key_projs[hc_idx](embeddings)
+            # norm1 可以在 CPU / HPU 上做, 也需要适当 norm1.to(device)
             normed_key = self.norm1[hc_idx](key)
-            query = hidden_states[:,:,hc_idx,:]
-            normed_query = self.norm2[hc_idx](query)
-            gate = (normed_key * normed_query).sum(dim=-1) / math.sqrt(backbone_config.hidden_size)
-            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-            gate = gate.sigmoid().unsqueeze(-1)
-            gates.append(gate)
-        gates = torch.stack(gates,dim=2)
-        value = gates * self.value_proj(embeddings).unsqueeze(2)
-        output = value + self.short_conv(value)
-        output = output.to(hpu_device)
-        return output
-
-    def manual_profile(self,hidden_states,input_ids):
-        with self.timer.measure("input_ids.to            "):
-            input_ids = input_ids.to(cpu_device)
-        with self.timer.measure("hash_mapping.hash       "):
-            hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
-        with self.timer.measure("multi_head_embedding    "):
-            embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-        with self.timer.measure("embeddings.to           "):
-            embeddings=embeddings.to(cpu_device)
-        hidden_states = hidden_states.to(hpu_device)
-
-        with self.timer.measure("value_proj              "):
-            value = self.value_proj(embeddings).unsqueeze(2)
-        with self.timer.measure("value_proj.to           "):
-            value = value.to(hpu_device)
-
-        normed_keys = []
-        with self.timer.measure("key_projs               "):
-            for hc_idx in range(backbone_config.hc_mult):
-                key = self.key_projs[hc_idx](embeddings)
-                normed_key = self.norm1[hc_idx](key)
-                normed_keys.append(normed_key)
-            normed_keys = torch.stack(normed_keys)
-        with self.timer.measure("normed_keys.to          "):
-            normed_keys = normed_keys.to(hpu_device)
-
-        gates = []
-        with self.timer.measure("scaled_dot_product_gates"):
-            for hc_idx in range(backbone_config.hc_mult):
-                query = hidden_states[:,:,hc_idx,:]
-                normed_query = self.norm2[hc_idx](query)
-                gate = (normed_keys[hc_idx] * normed_query).sum(dim=-1) / math.sqrt(backbone_config.hidden_size)
-                gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-                gate = gate.sigmoid().unsqueeze(-1)
-                gates.append(gate)
-            gates = torch.stack(gates,dim=2)
-            value = gates * value
-            
-        with self.timer.measure("short_conv              "):
-            output = value + self.short_conv(value)
-
-        return output
+            normed_keys.append(normed_key)
+        normed_keys = torch.stack(normed_keys)
+        #print(f"[Engram_host Layer {self.layer_id}] done.")
+        return value, normed_keys
 
 @wrap_in_hpu_graph
 class Engram_device(nn.Module):
@@ -617,7 +542,7 @@ class TransformerBlock(nn.Module):
     def forward(self, hidden_states):
         #print(f"--- in TransformerBlock forward {self.layer_id} ---")
         hidden_states = self.attn(hidden_states) + hidden_states
-        for _ in range(1000):
+        for _ in range(10):
             hidden_states = self.Fake_proj(hidden_states)
         hidden_states = self.moe(hidden_states) + hidden_states
         #print(f"  TransformerBlock done. hidden_states:{hidden_states}")
@@ -635,17 +560,17 @@ class GetEngram(nn.Module):
     
     def forward(self, hidden_states):
         #print(f"--- in TransformerBlockWithEngram forward {self.layer_id} ---")
-        with self.timer.measure("engram_hpu_graph_wrapper"):
+        with self.timer.measure(f"layer_{self.layer_id}_join  "):
             value, normed_keys = self.engram_manager.get_engram_output(self.layer_id)
+        with self.timer.measure(f"layer_{self.layer_id}_device"):
             hidden_states = self.engram_device(hidden_states, value, normed_keys) + hidden_states
             #print(f"[Engram Layer {self.layer_id}] engram_out:{engram_out} hidden_states:{hidden_states}")
         #print(f"[TransformerBlock Layer {self.layer_id}] hidden_states:{hidden_states}")
         return hidden_states
     
-class TransformerBlockWithEngram(TransformerBlock):
+class TransformerBlockWithEngram(nn.Module):
     def __init__(self,layer_id,timer,engram_manager):
         super().__init__()
-        self.engram_manager = engram_manager
         self.engram_device = Engram_device(layer_id=layer_id,timer=timer)
         self.get_engram = GetEngram(layer_id=layer_id,timer=timer,engram_manager=engram_manager)
         self.transformer_block = TransformerBlock()
@@ -672,8 +597,9 @@ class EngramManager:
         with self.timer.measure(f"layer_{layer_id}_cpu_compute"):
             value, normed_keys = layer(input_ids=input_ids)
 
-        value_hpu  = value.to("hpu")
-        normed_keys_hpu  = normed_keys.to("hpu")
+        with self.timer.measure(f"layer_{layer_id}_to_hpu     "):
+            value_hpu  = value.to("hpu")
+            normed_keys_hpu  = normed_keys.to("hpu")
         '''
         transfer_stream = ht.Stream()
         with ht.stream(transfer_stream):
@@ -830,7 +756,7 @@ if __name__ == '__main__':
         #record_shapes=True,
         #profile_memory=True,
         with_stack=True,
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('./profile_logs')
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./profile_logs', use_gzip=True)
     ) as profiler:
         with torch.no_grad():
             for i in range(int(10)):

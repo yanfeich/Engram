@@ -144,8 +144,8 @@ class EngramConfig:
 
 
     # original config 0.662B
-    layer_ids: List[int] = field(default_factory=lambda: [1,15])
-    #layer_ids: List[int] = field(default_factory=lambda: [1])
+    #layer_ids: List[int] = field(default_factory=lambda: [1,15])
+    layer_ids: List[int] = field(default_factory=lambda: [1])
     engram_vocab_size: List[int] = field(default_factory=lambda: [129280*5, 129280*5])
     n_embed_per_ngram: int = 512
 
@@ -168,7 +168,7 @@ class BackBoneConfig:
     hidden_size: int = 1024
     hc_mult: int = 4
     vocab_size: int = 129280
-    num_layers: int = 30 # 30
+    num_layers: int = 3 # 30
     
 engram_cfg = EngramConfig()
 backbone_config = BackBoneConfig()
@@ -584,24 +584,27 @@ class Engram_host(nn.Module):
         """
         # ***** This is a device boundary *****
         input_ids = input_ids.to(hash_emb_device)
-        hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids, self.layer_id))
-        embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-        embeddings=embeddings.to(linear_device)
+        with self.timer.measure("engram_host  "):
+            hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids, self.layer_id))
+            embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
+            embeddings=embeddings.to(linear_device)
 
-        # ***** Either This is a device boundary *****
-        value = self.value_proj(embeddings).unsqueeze(2)
-        normed_keys = []
-        for hc_idx in range(backbone_config.hc_mult):
-            key = self.key_projs[hc_idx](embeddings)
-            # norm1 可以在 CPU / HPU 上做, 也需要适当 norm1.to(device)
-            normed_key = self.norm1[hc_idx](key)
-            normed_keys.append(normed_key)
-        normed_keys = torch.stack(normed_keys)
-        value=value.to(conv_device)
-        normed_keys=normed_keys.to(conv_device)
+            # ***** Either This is a device boundary *****
+            value = self.value_proj(embeddings).unsqueeze(2)
+            normed_keys = []
+            for hc_idx in range(backbone_config.hc_mult):
+                key = self.key_projs[hc_idx](embeddings)
+                # norm1 可以在 CPU / HPU 上做, 也需要适当 norm1.to(device)
+                normed_key = self.norm1[hc_idx](key)
+                normed_keys.append(normed_key)
+            normed_keys = torch.stack(normed_keys)
+        with self.timer.measure("to_hpu       "):
+            value=value.to(conv_device)
+            normed_keys=normed_keys.to(conv_device)
 
         return value, normed_keys
 
+@wrap_in_hpu_graph
 class Engram_device(nn.Module):
     def __init__(self, layer_id,timer):
         super().__init__()
@@ -664,7 +667,7 @@ class TransformerBlock(nn.Module):
             hidden_states = self.engram(hidden_states=hidden_states,input_ids=input_ids) + hidden_states
             '''
             value, normed_keys = self.engram_host(input_ids=input_ids)
-            with self.timer.measure("engram_hpu_graph_wrapper"):
+            with self.timer.measure("engram_device"):
                 hidden_states = self.engram_device(hidden_states, value, normed_keys) + hidden_states
         hidden_states = self.attn(hidden_states) + hidden_states
         hidden_states = self.moe(hidden_states) + hidden_states
@@ -778,7 +781,7 @@ if __name__ == '__main__':
         #record_shapes=True,
         #profile_memory=True,
         with_stack=True,
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('./profile_logs')
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./profile_logs', use_gzip=True)
     ) as profiler:
         with torch.no_grad():
             for i in range(int(10)):
