@@ -308,7 +308,7 @@ class Engram_host(nn.Module):
         )
         self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(cpu_device) for _ in range(backbone_config.hc_mult)])
 
-        #self._init_cpp_engram()
+        self._init_cpp_engram()
 
         print(f"[Engram]: multi_head_embedding[{layer_id}]: num_embeddings={self.mhe_embedding.num_embeddings}, embedding_dim={self.mhe_embedding.embedding_dim}, params={human_format(self.mhe_embedding.num_embeddings*self.mhe_embedding.embedding_dim)}")
         
@@ -495,8 +495,8 @@ class Engram_host(nn.Module):
         input_ids: [B, L]
         """
         with self.timer.measure("engram_host  "):
-            embeddings = self.hash_and_embed(input_ids)
-            #embeddings = self.cpp_engram.forward(input_ids)
+            #embeddings = self.hash_and_embed(input_ids)
+            embeddings = self.cpp_engram.forward(input_ids)
             #embeddings=embeddings.to(cpu_device)
 
             value = self.value_proj(embeddings).unsqueeze(2)
