@@ -132,7 +132,7 @@ class EngramConfig:
     # original config 0.662B
     #layer_ids: List[int] = field(default_factory=lambda: [1])
     #layer_ids: List[int] = field(default_factory=lambda: [1,15])
-    layer_ids: List[int] = field(default_factory=lambda: [1])
+    layer_ids: List[int] = field(default_factory=lambda: [1,3])
     engram_vocab_size: List[int] = field(default_factory=lambda: [129280*5, 129280*5])
     n_embed_per_ngram: int = 512
 
@@ -160,69 +160,6 @@ class BackBoneConfig:
 engram_cfg = EngramConfig()
 backbone_config = BackBoneConfig()
 
-
-class CompressedTokenizer:
-    def __init__(
-        self,
-        tokenizer_name_or_path,
-    ):
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, trust_remote_code=True)
-        
-        SENTINEL = "\uE000"
-        self.normalizer = normalizers.Sequence([
-            normalizers.NFKC(),
-            normalizers.NFD(),
-            normalizers.StripAccents(),
-            normalizers.Lowercase(),
-            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
-            normalizers.Replace(Regex(r"^ $"), SENTINEL),
-            normalizers.Strip(),
-            normalizers.Replace(SENTINEL, " "),
-        ])
-        
-        self.lookup_table, self.num_new_token = self._build_lookup_table()
-    
-    def __len__(self):
-        return self.num_new_token
-    
-    def _build_lookup_table(self):
-        old2new = {}
-        key2new = {}          
-        new_tokens = []
-
-        vocab_size = len(self.tokenizer)
-        for tid in range(vocab_size):
-            text = self.tokenizer.decode([tid], skip_special_tokens=False)
-            
-            if "�" in text:
-                key = self.tokenizer.convert_ids_to_tokens(tid)
-            else:
-                norm = self.normalizer.normalize_str(text)
-                key = norm if norm else text
-
-            nid = key2new.get(key)
-            if nid is None:
-                nid = len(new_tokens)
-                key2new[key] = nid
-                new_tokens.append(key)
-            old2new[tid] = nid
-        
-        lookup = np.empty(vocab_size, dtype=np.int64)
-        for tid in range(vocab_size):
-            lookup[tid] = old2new[tid]
-
-        return lookup, len(new_tokens)
-    
-    def _compress(self, input_ids):
-        arr = np.asarray(input_ids, dtype=np.int64)
-        pos_mask = arr >= 0
-        out = arr.copy()
-        valid_ids = arr[pos_mask]
-        out[pos_mask] = self.lookup_table[valid_ids]
-        return out   
-    
-    def __call__(self, input_ids):
-        return self._compress(input_ids)
             
 class ShortConv(nn.Module):
     def __init__(
@@ -289,31 +226,43 @@ def find_next_prime(start, seen_primes):
             return candidate
         candidate += 1
 
-class NgramHashMapping:
-    def __init__(
-        self, 
-        engram_vocab_size,
-        max_ngram_size,
-        n_embed_per_ngram,
-        n_head_per_ngram,
-        layer_ids,
-        tokenizer_name_or_path,
-        pad_id,
-        seed,  
-    ):
-        self.vocab_size_per_ngram = engram_vocab_size
-        self.max_ngram_size = max_ngram_size
-        self.n_embed_per_ngram = n_embed_per_ngram
-        self.n_head_per_ngram = n_head_per_ngram
-        self.pad_id = pad_id
-        self.layer_ids = layer_ids
+    
+class Engram_host(nn.Module):
+    def __init__(self, layer_id,timer):
+        super().__init__()
+        
+        torch.manual_seed(random_seed+layer_id)
+        np.random.seed(random_seed+layer_id)
+        self.timer = timer
+        self.layer_id = layer_id
 
-        self.compressed_tokenizer = CompressedTokenizer(
-            tokenizer_name_or_path=tokenizer_name_or_path
-        )            
-        self.tokenizer_vocab_size = len(self.compressed_tokenizer)
+        # NgramHashMapping
+        self.vocab_size_per_ngram = engram_cfg.engram_vocab_size
+        self.max_ngram_size = engram_cfg.max_ngram_size
+        self.n_embed_per_ngram = engram_cfg.n_embed_per_ngram
+        self.n_head_per_ngram = engram_cfg.n_head_per_ngram
+        self.pad_id = engram_cfg.pad_id
+        self.layer_ids = engram_cfg.layer_ids
+
+        # CompressedTokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(engram_cfg.tokenizer_name_or_path, trust_remote_code=True)
+        
+        SENTINEL = "\uE000"
+        self.normalizer = normalizers.Sequence([
+            normalizers.NFKC(),
+            normalizers.NFD(),
+            normalizers.StripAccents(),
+            normalizers.Lowercase(),
+            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
+            normalizers.Replace(Regex(r"^ $"), SENTINEL),
+            normalizers.Strip(),
+            normalizers.Replace(SENTINEL, " "),
+        ])
+        
+        self.lookup_table, self.tokenizer_vocab_size = self._build_lookup_table()
+
         if self.pad_id is not None:
-            self.pad_id = int(self.compressed_tokenizer.lookup_table[self.pad_id])
+            self.pad_id = int(self.lookup_table[self.pad_id])
 
         max_long = np.iinfo(np.int64).max
         M_max = int(max_long // self.tokenizer_vocab_size)
@@ -323,7 +272,7 @@ class NgramHashMapping:
         self.layer_multipliers = {}
 
         for layer_id in self.layer_ids:
-            base_seed = int(seed + PRIME_1 * int(layer_id))
+            base_seed = int(engram_cfg.seed + PRIME_1 * int(layer_id))
             g = np.random.default_rng(base_seed)
             r = g.integers(
                 low=0,
@@ -335,6 +284,124 @@ class NgramHashMapping:
             self.layer_multipliers[layer_id] = multipliers
 
         self.vocab_size_across_layers = self.calculate_vocab_size_across_layers()
+
+        # MultiHeadEmbedding
+        list_of_N = [x for y in self.vocab_size_across_layers[self.layer_id] for x in y]
+        D = engram_cfg.n_embed_per_ngram // engram_cfg.n_head_per_ngram
+        super().__init__()
+        self.num_heads = len(list_of_N)
+        self.embedding_dim = D
+        
+        offsets = [0]
+        for n in list_of_N[:-1]:
+            offsets.append(offsets[-1] + n)
+        
+        self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.long))
+        
+        total_N = sum(list_of_N)
+        self.mhe_embedding = nn.Embedding(num_embeddings=total_N, embedding_dim=D)
+
+        engram_hidden_size = (engram_cfg.max_ngram_size-1) * engram_cfg.n_embed_per_ngram
+        self.value_proj = nn.Linear(engram_hidden_size,backbone_config.hidden_size).to(cpu_device)
+        self.key_projs = nn.ModuleList(
+            [nn.Linear(engram_hidden_size, backbone_config.hidden_size).to(cpu_device) for _ in range(backbone_config.hc_mult)]
+        )
+        self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(cpu_device) for _ in range(backbone_config.hc_mult)])
+
+        #self._init_cpp_engram()
+
+        print(f"[Engram]: multi_head_embedding[{layer_id}]: num_embeddings={self.mhe_embedding.num_embeddings}, embedding_dim={self.mhe_embedding.embedding_dim}, params={human_format(self.mhe_embedding.num_embeddings*self.mhe_embedding.embedding_dim)}")
+        
+    def _init_cpp_engram(self):
+        """初始化C++版本的Engram"""
+        import engram_cpu
+        
+        # 准备配置
+        config = engram_cpu.EngramConfig()
+        config.engram_vocab_size = self.vocab_size_per_ngram
+        config.max_ngram_size = self.max_ngram_size
+        config.n_embed_per_ngram = self.n_embed_per_ngram
+        config.n_head_per_ngram = self.n_head_per_ngram
+        config.layer_ids = self.layer_ids
+        config.pad_id = self.pad_id
+        config.seed = engram_cfg.seed
+        config.kernel_size = engram_cfg.kernel_size
+        config.hidden_size = backbone_config.hidden_size
+        config.hc_mult = backbone_config.hc_mult
+        config.tokenizer_vocab_size = self.tokenizer_vocab_size
+        
+        # 展平layer_multipliers
+        if self.layer_id not in self.layer_multipliers:
+            raise ValueError(f"Layer ID {self.layer_id} not found in layer_multipliers")
+        multipliers_list = self.layer_multipliers[self.layer_id].tolist()
+        
+        # 获取当前层的vocab sizes
+        if self.layer_id not in self.vocab_size_across_layers:
+            raise ValueError(f"Layer ID {self.layer_id} not found in vocab_size_across_layers")
+        vocab_sizes_for_layer = self.vocab_size_across_layers[self.layer_id]
+        # 转换为list of list of int
+        vocab_sizes_list = []
+        for ngram_list in vocab_sizes_for_layer:
+            vocab_sizes_list.append([int(x) for x in ngram_list])
+        
+        # 准备offsets
+        offsets_np = self.offsets.cpu().numpy().tolist()
+        
+        # 获取embedding权重
+        embedding_weights = self.mhe_embedding.weight.detach().cpu()
+        
+        # 获取projection层权重
+        value_proj_weight = self.value_proj.weight.detach().cpu()
+        value_proj_bias = self.value_proj.bias.detach().cpu()
+        
+        key_proj_weights = []
+        key_proj_biases = []
+        for proj in self.key_projs:
+            key_proj_weights.append(proj.weight.detach().cpu())
+            key_proj_biases.append(proj.bias.detach().cpu())
+        
+        norm_weights = []
+        for norm in self.norm1:
+            norm_weights.append(norm.weight.detach().cpu())
+        
+        # 创建C++ Engram对象
+        self.cpp_engram = engram_cpu.EngramCPU(
+            layer_id=self.layer_id,
+            config=config,
+            lookup_table=self.lookup_table.tolist(),
+            multipliers=multipliers_list,
+            vocab_sizes_for_layer=vocab_sizes_list,
+            offsets=offsets_np,
+            embedding_weights=embedding_weights,
+        )
+
+    def _build_lookup_table(self):
+        old2new = {}
+        key2new = {}          
+        new_tokens = []
+
+        vocab_size = len(self.tokenizer)
+        for tid in range(vocab_size):
+            text = self.tokenizer.decode([tid], skip_special_tokens=False)
+            
+            if "�" in text:
+                key = self.tokenizer.convert_ids_to_tokens(tid)
+            else:
+                norm = self.normalizer.normalize_str(text)
+                key = norm if norm else text
+
+            nid = key2new.get(key)
+            if nid is None:
+                nid = len(new_tokens)
+                key2new[key] = nid
+                new_tokens.append(key)
+            old2new[tid] = nid
+        
+        lookup = np.empty(vocab_size, dtype=np.int64)
+        for tid in range(vocab_size):
+            lookup[tid] = old2new[tid]
+
+        return lookup, len(new_tokens)
 
     def calculate_vocab_size_across_layers(self):
         seen_primes = set()
@@ -363,15 +430,22 @@ class NgramHashMapping:
             
         return vocab_size_across_layers
 
+    def compressed_tokenizer(self, input_ids):
+        arr = np.asarray(input_ids, dtype=np.int64)
+        pos_mask = arr >= 0
+        out = arr.copy()
+        valid_ids = arr[pos_mask]
+        out[pos_mask] = self.lookup_table[valid_ids]
+        return out   
+
     def _get_ngram_hashes(
         self,
         input_ids: np.ndarray,
-        layer_id: int,
     ) -> np.ndarray:
         x = np.asarray(input_ids, dtype=np.int64)
         B, T = x.shape
 
-        multipliers = self.layer_multipliers[layer_id]
+        multipliers = self.layer_multipliers[self.layer_id]
 
         def shift_k(k: int) -> np.ndarray:
             if k == 0: return x
@@ -390,7 +464,7 @@ class NgramHashMapping:
             for k in range(1, n):
                 mix = np.bitwise_xor(mix, tokens[k] * multipliers[k])
             num_heads_for_this_ngram = self.n_head_per_ngram
-            head_vocab_sizes = self.vocab_size_across_layers[layer_id][n_gram_index]
+            head_vocab_sizes = self.vocab_size_across_layers[self.layer_id][n_gram_index]
             
             for j in range(num_heads_for_this_ngram):
                 mod = int(head_vocab_sizes[j])
@@ -399,70 +473,21 @@ class NgramHashMapping:
         
         return np.stack(all_hashes, axis=2)
 
-    def hash(self, input_ids, layer_id):
+    def hash(self, input_ids):
         input_ids = self.compressed_tokenizer(input_ids)
-        # hash_ids_for_all_layers = {}
-        # for layer_id in self.layer_ids:
-        #     hash_ids_for_all_layers[layer_id] = self._get_ngram_hashes(input_ids, layer_id=layer_id)
-        hash_ids_for_one_layer = self._get_ngram_hashes(input_ids, layer_id=layer_id)
+        hash_ids_for_one_layer = self._get_ngram_hashes(input_ids)
         return hash_ids_for_one_layer
 
-class MultiHeadEmbedding(nn.Module):
-    def __init__(self, list_of_N: List[int], D: int):
-        super().__init__()
-        self.num_heads = len(list_of_N)
-        self.embedding_dim = D
-        
-        offsets = [0]
-        for n in list_of_N[:-1]:
-            offsets.append(offsets[-1] + n)
-        
-        self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.long))
-        
-        total_N = sum(list_of_N)
-        self.mhe_embedding = nn.Embedding(num_embeddings=total_N, embedding_dim=D)
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def multi_head_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         shifted_input_ids = input_ids + self.offsets
         output = self.mhe_embedding(shifted_input_ids)
         
         return output
-    
-class Engram_host(nn.Module):
-    def __init__(self, layer_id,timer):
-        super().__init__()
-        torch.manual_seed(random_seed+layer_id)
-        np.random.seed(random_seed+layer_id)
-        self.timer = timer
-        self.layer_id = layer_id
 
-        self.hash_mapping = NgramHashMapping(
-            engram_vocab_size=engram_cfg.engram_vocab_size,
-            max_ngram_size = engram_cfg.max_ngram_size,
-            n_embed_per_ngram = engram_cfg.n_embed_per_ngram,
-            n_head_per_ngram = engram_cfg.n_head_per_ngram,
-            layer_ids = engram_cfg.layer_ids,
-            tokenizer_name_or_path=engram_cfg.tokenizer_name_or_path,
-            pad_id = engram_cfg.pad_id,
-            seed = engram_cfg.seed,
-        )
-        self.multi_head_embedding = MultiHeadEmbedding(
-            list_of_N = [x for y in self.hash_mapping.vocab_size_across_layers[self.layer_id] for x in y],
-            D = engram_cfg.n_embed_per_ngram // engram_cfg.n_head_per_ngram,
-        )
-
-        engram_hidden_size = (engram_cfg.max_ngram_size-1) * engram_cfg.n_embed_per_ngram
-        self.value_proj = nn.Linear(engram_hidden_size,backbone_config.hidden_size).to(cpu_device)
-        self.key_projs = nn.ModuleList(
-            [nn.Linear(engram_hidden_size, backbone_config.hidden_size).to(cpu_device) for _ in range(backbone_config.hc_mult)]
-        )
-        self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size).to(cpu_device) for _ in range(backbone_config.hc_mult)])
-
-        print(f"[Engram]: multi_head_embedding[{layer_id}]: num_embeddings={self.multi_head_embedding.mhe_embedding.num_embeddings}, embedding_dim={self.multi_head_embedding.mhe_embedding.embedding_dim}, params={human_format(self.multi_head_embedding.mhe_embedding.num_embeddings*self.multi_head_embedding.mhe_embedding.embedding_dim)}")
-        
-        # For shortest CPU time test use only
-        #self.fake_value = torch.zeros((B,L,1,backbone_config.hidden_size),dtype=torch.get_default_dtype())
-        #self.fake_keys = torch.zeros((backbone_config.hc_mult,B,L,backbone_config.hidden_size),dtype=torch.get_default_dtype())
+    def hash_and_embed(self, input_ids):
+        hash_input_ids = torch.from_numpy(self.hash(input_ids)).to(cpu_device)
+        embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
+        return embeddings
 
     def forward(self,input_ids):
         """
@@ -470,20 +495,17 @@ class Engram_host(nn.Module):
         input_ids: [B, L]
         """
         with self.timer.measure("engram_host  "):
-            #print(f"[Engram_host Layer {self.layer_id}] starts...")
-            hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids,self.layer_id))
-            embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
+            embeddings = self.hash_and_embed(input_ids)
+            #embeddings = self.cpp_engram.forward(input_ids)
             #embeddings=embeddings.to(cpu_device)
 
             value = self.value_proj(embeddings).unsqueeze(2)
             normed_keys = []
             for hc_idx in range(backbone_config.hc_mult):
                 key = self.key_projs[hc_idx](embeddings)
-                # norm1 可以在 CPU / HPU 上做, 也需要适当 norm1.to(device)
                 normed_key = self.norm1[hc_idx](key)
                 normed_keys.append(normed_key)
             normed_keys = torch.stack(normed_keys)
-        #print(f"[Engram_host Layer {self.layer_id}] done.")
         return value, normed_keys
 
 @wrap_in_hpu_graph
@@ -530,7 +552,7 @@ class Embedding(nn.Module):
         # hidden_states = self.Fake_proj(hidden_states)
         return hidden_states
 
-#@wrap_in_hpu_graph
+@wrap_in_hpu_graph
 class TransformerBlock(nn.Module):
     def __init__(self):
         super().__init__()
