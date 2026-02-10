@@ -55,6 +55,7 @@ from tokenizers import normalizers, Regex
 
 cpu_device = torch.device("cpu")
 hpu_device = torch.device("hpu")
+torch.set_printoptions(linewidth=800)
 
 random_seed = 102
 torch.manual_seed(random_seed)
@@ -327,6 +328,7 @@ class Engram_host(nn.Module):
         config.seed = engram_cfg.seed
         config.kernel_size = engram_cfg.kernel_size
         config.hidden_size = backbone_config.hidden_size
+        config.engram_hidden_size = (engram_cfg.max_ngram_size-1) * engram_cfg.n_embed_per_ngram
         config.hc_mult = backbone_config.hc_mult
         config.tokenizer_vocab_size = self.tokenizer_vocab_size
         
@@ -354,15 +356,18 @@ class Engram_host(nn.Module):
         value_proj_weight = self.value_proj.weight.detach().cpu()
         value_proj_bias = self.value_proj.bias.detach().cpu()
         
-        key_proj_weights = []
-        key_proj_biases = []
+        k_weights = []
+        k_biases = []
         for proj in self.key_projs:
-            key_proj_weights.append(proj.weight.detach().cpu())
-            key_proj_biases.append(proj.bias.detach().cpu())
+            k_weights.append(proj.weight.detach().cpu())
+            k_biases.append(proj.bias.detach().cpu())
+        key_proj_weights = torch.stack(k_weights)
+        key_proj_biases = torch.stack(k_biases)
         
-        norm_weights = []
+        k_norm_weights = []
         for norm in self.norm1:
-            norm_weights.append(norm.weight.detach().cpu())
+            k_norm_weights.append(norm.weight.detach().cpu())
+        key_norm_weight = torch.stack(k_norm_weights)
         
         # 创建C++ Engram对象
         self.cpp_engram = engram_cpu.EngramCPU(
@@ -374,6 +379,7 @@ class Engram_host(nn.Module):
             offsets=offsets_np,
             embedding_weights=embedding_weights,
         )
+        self.cpp_engram.set_weights(key_proj_weights,key_proj_biases, key_norm_weight, value_proj_weight, value_proj_bias)
 
     def _build_lookup_table(self):
         old2new = {}
@@ -456,7 +462,8 @@ class Engram_host(nn.Module):
         base_shifts = [shift_k(k) for k in range(self.max_ngram_size)]
 
         all_hashes = []
-        
+
+        # original version, straightforward but redundant computation for 3-gram
         for n in range(2, self.max_ngram_size + 1):
             n_gram_index = n - 2
             tokens = base_shifts[:n]
@@ -465,12 +472,31 @@ class Engram_host(nn.Module):
                 mix = np.bitwise_xor(mix, tokens[k] * multipliers[k])
             num_heads_for_this_ngram = self.n_head_per_ngram
             head_vocab_sizes = self.vocab_size_across_layers[self.layer_id][n_gram_index]
-            
+
             for j in range(num_heads_for_this_ngram):
                 mod = int(head_vocab_sizes[j])
                 head_hash = mix % mod
                 all_hashes.append(head_hash.astype(np.int64, copy=False))
-        
+        '''
+        # 版本1, 3-gram 复用 2-gram 计算重复部分
+        # tokens[k] * multipliers[k]
+        # bitwise_xor
+        # 但缓存性能差
+        max_n = self.max_ngram_size
+        all_weighted_tokens = [base_shifts[i] * multipliers[i] for i in range(max_n)]
+        mix_k = []
+        mix = all_weighted_tokens[0]
+        for k in range(1, max_n):
+            mix = np.bitwise_xor(mix, all_weighted_tokens[k])
+            mix_k.append(mix)
+        for n in range(2, max_n + 1):
+            head_vocab_sizes = self.vocab_size_across_layers[self.layer_id][n - 2]
+            for j in range(self.n_head_per_ngram):
+                mod = int(head_vocab_sizes[j])
+                head_hash = mix_k[n-2] % mod
+                all_hashes.append(head_hash.astype(np.int64, copy=False))
+        '''
+
         return np.stack(all_hashes, axis=2)
 
     def hash(self, input_ids):
@@ -490,24 +516,30 @@ class Engram_host(nn.Module):
         return embeddings
 
     def forward(self,input_ids):
+        value, normed_keys = self.cpp_engram.forward(input_ids)
+        #print(f"Engram_host forward output - value: {value}\nnormed_keys:  {normed_keys}")
+        return value, normed_keys
+
         """
         hidden_states: [B, L, HC_MULT, D]
         input_ids: [B, L]
         """
         with self.timer.measure("engram_host  "):
-            #embeddings = self.hash_and_embed(input_ids)
-            embeddings = self.cpp_engram.forward(input_ids)
+            embeddings = self.hash_and_embed(input_ids)
+            #embeddings = self.cpp_engram.forward(input_ids)
             #embeddings=embeddings.to(cpu_device)
-
+        
             value = self.value_proj(embeddings).unsqueeze(2)
+            #print(f"Engram_host forward - embeddings: {embeddings}")
             normed_keys = []
             for hc_idx in range(backbone_config.hc_mult):
                 key = self.key_projs[hc_idx](embeddings)
                 normed_key = self.norm1[hc_idx](key)
                 normed_keys.append(normed_key)
             normed_keys = torch.stack(normed_keys)
+        #print(f"Engram_host forward output - value: {value}\nnormed_keys:  {normed_keys}")
         return value, normed_keys
-
+    
 @wrap_in_hpu_graph
 class Engram_device(nn.Module):
     def __init__(self, layer_id,timer):

@@ -17,6 +17,7 @@ PYBIND11_MODULE(engram_cpu, m) {
         .def_readwrite("seed", &EngramCPU::Config::seed)
         .def_readwrite("kernel_size", &EngramCPU::Config::kernel_size)
         .def_readwrite("hidden_size", &EngramCPU::Config::hidden_size)
+        .def_readwrite("engram_hidden_size", &EngramCPU::Config::engram_hidden_size)
         .def_readwrite("hc_mult", &EngramCPU::Config::hc_mult)
         .def_readwrite("tokenizer_vocab_size", &EngramCPU::Config::tokenizer_vocab_size);
     
@@ -33,5 +34,11 @@ PYBIND11_MODULE(engram_cpu, m) {
             py::arg("lookup_table"), py::arg("multipliers"),
             py::arg("vocab_sizes_for_layer"), py::arg("offsets"),
             py::arg("embedding_weights"))
+        .def("set_weights", &EngramCPU::set_weights,
+             py::arg("k_weight"),
+             py::arg("k_bias"),
+             py::arg("k_norm_weight"),
+             py::arg("v_weight"),
+             py::arg("v_bias"))
         .def("forward", &EngramCPU::forward, py::arg("input_ids"));
 }
