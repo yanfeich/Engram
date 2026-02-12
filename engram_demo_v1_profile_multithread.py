@@ -28,6 +28,17 @@ import os
 import time
 import glob
 import argparse
+os.environ['DNNL_MAX_CPU_ISA'] = 'AVX512_CORE_AMX'
+os.environ['DNNL_CPU_RUNTIME'] = 'OMP'
+os.environ['DNNL_PRIMITIVE_CACHE_CAPACITY'] = '1024'
+os.environ['OMP_PROC_BIND'] = 'FALSE'
+os.environ['KMP_AFFINITY'] = 'granularity=fine,scatter'
+os.environ['KMP_BLOCKTIME'] = '1'
+os.environ['OMP_WAIT_POLICY'] = 'PASSIVE'
+_logical_cores = os.cpu_count() or 1
+_default_omp_threads = max(1, min(_logical_cores // 4, 32))
+#os.environ.setdefault('OMP_NUM_THREADS', str(_default_omp_threads))
+#os.environ.setdefault('MKL_NUM_THREADS', os.environ['OMP_NUM_THREADS'])
 os.environ['PT_HPU_LAZY_MODE'] = '1'
 os.environ['HABANA_PROFILE'] = '1'
 
@@ -737,6 +748,10 @@ if __name__ == '__main__':
     parser.add_argument('--hidden-size', type=int, default=1024, help='Embedding dims for Transformer (Hidden size).')
     parser.add_argument('--dtype', type=str, default="fp32", help='data type.')
     args = parser.parse_args()
+
+    _omp_threads = int(os.environ.get('OMP_NUM_THREADS', '1'))
+    torch.set_num_threads(_omp_threads)
+    torch.set_num_interop_threads(max(1, _omp_threads // 2))
 
     backbone_config.hidden_size = int(args.hidden_size)
     engram_cfg.n_embed_per_ngram = int(args.n_embed_per_ngram)

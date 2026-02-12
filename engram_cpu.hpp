@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <torch/extension.h>
 #include <oneapi/dnnl/dnnl.hpp>
 
@@ -94,6 +95,23 @@ private:
     dnnl::matmul::primitive_desc value_matmul_pd_;
     dnnl::matmul value_matmul_primitive_;
 
+    struct PrimitiveCache {
+        int64_t m = -1;
+        dnnl::memory::desc src_md;
+        dnnl::memory::desc dst_md;
+        dnnl::memory::desc bias_md;
+        dnnl::matmul::primitive_desc value_pd;
+        dnnl::matmul value_prim;
+        std::vector<dnnl::matmul::primitive_desc> key_pds;
+        std::vector<dnnl::matmul> key_prims;
+        std::vector<dnnl::layer_normalization_forward::primitive_desc> norm_pds;
+        std::vector<dnnl::layer_normalization_forward> norm_prims;
+        std::vector<dnnl::memory> mean_mems;
+        std::vector<dnnl::memory> var_mems;
+    };
+
+    std::unordered_map<int64_t, PrimitiveCache> primitive_cache_;
+
     // Primitive 参数
     std::vector<std::unordered_map<int, dnnl::memory>> key_matmul_args_;
     std::vector<std::unordered_map<int, dnnl::memory>> norm_args_;
@@ -103,13 +121,22 @@ private:
     dnnl::memory::data_type dtype_;
 
     // Helper methods
-    std::vector<int64_t> compressed_tokenizer(const std::vector<int64_t>& input_ids, int64_t B, int64_t T);
-    std::vector<std::vector<int64_t>> get_ngram_hashes(
+    void compressed_tokenizer(const int64_t* input_ids, int64_t B, int64_t T, std::vector<int64_t>& out);
+    void get_ngram_hashes(
         const std::vector<int64_t>& compressed_ids,
         int64_t B,
-        int64_t T
+        int64_t T,
+        std::vector<int64_t>& out
     );
-    torch::Tensor multi_head_embedding(const std::vector<std::vector<int64_t>>& hash_ids, int64_t B, int64_t T);
+    void multi_head_embedding(const std::vector<int64_t>& hash_ids, int64_t B, int64_t T, torch::Tensor& output);
+    PrimitiveCache& get_or_create_cache(int64_t m);
+
+    int64_t total_heads_ = 0;
+    int64_t embed_dim_per_head_ = 0;
+
+    std::vector<int64_t> compressed_ids_buffer_;
+    std::vector<int64_t> hash_ids_buffer_;
+    torch::Tensor embeddings_buffer_;
 };
 
 // 显式实例化

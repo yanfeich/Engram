@@ -21,11 +21,23 @@ ext_modules = [
         library_dirs=[ONEDNN_LIBRARY_PATH],
         libraries=['dnnl'],
         extra_compile_args={
-            'cxx': ['-O3', '-march=native', '-fopenmp', '-std=c++17', '-mavx512f', '-mavx512cd', '-mavx512bw', 
-                    '-mavx512dq', '-mavx512vl', '-mfma', '-mamx-tile', '-mamx-int8', '-mamx-bf16', '-DUSE_AMX=1',
-                    '-DDNNL_FOUND=1']
+            'cxx': [
+                '-O3', '-DNDEBUG', '-std=c++17',
+                '-march=native', '-mtune=native',
+                '-fopenmp',
+                '-mavx512f', '-mavx512cd', '-mavx512bw',
+                '-mavx512dq', '-mavx512vl', '-mfma',
+                '-mamx-tile', '-mamx-int8', '-mamx-bf16',
+                '-fno-plt', '-fvisibility=hidden',
+                '-DUSE_AMX=1', '-DDNNL_FOUND=1'
+            ]
         },
-        extra_link_args=['-fopenmp', '-ldnnl'],
+        extra_link_args=[
+            '-fopenmp',
+            '-Wl,--as-needed',
+            f'-Wl,-rpath,{ONEDNN_LIBRARY_PATH}',
+            '-ldnnl'
+        ],
     )
 ]
 
