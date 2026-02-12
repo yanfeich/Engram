@@ -270,19 +270,16 @@ class Engram_host(nn.Module):
         half_bound = max(1, M_max // 2)
         PRIME_1 = 10007
         
-        self.layer_multipliers = {}
+        base_seed = int(engram_cfg.seed + PRIME_1 * int(layer_id))
+        g = np.random.default_rng(base_seed)
+        r = g.integers(
+            low=0,
+            high=half_bound,
+            size=(self.max_ngram_size,),
+            dtype=np.int64
+        )
+        self.layer_multipliers = r * 2 + 1
 
-        for layer_id in self.layer_ids:
-            base_seed = int(engram_cfg.seed + PRIME_1 * int(layer_id))
-            g = np.random.default_rng(base_seed)
-            r = g.integers(
-                low=0,
-                high=half_bound,
-                size=(self.max_ngram_size,),
-                dtype=np.int64
-            )
-            multipliers = r * 2 + 1
-            self.layer_multipliers[layer_id] = multipliers
 
         self.vocab_size_across_layers = self.calculate_vocab_size_across_layers()
 
@@ -332,10 +329,7 @@ class Engram_host(nn.Module):
         config.hc_mult = backbone_config.hc_mult
         config.tokenizer_vocab_size = self.tokenizer_vocab_size
         
-        # 展平layer_multipliers
-        if self.layer_id not in self.layer_multipliers:
-            raise ValueError(f"Layer ID {self.layer_id} not found in layer_multipliers")
-        multipliers_list = self.layer_multipliers[self.layer_id].tolist()
+        multipliers_list = self.layer_multipliers.tolist()
         
         # 获取当前层的vocab sizes
         if self.layer_id not in self.vocab_size_across_layers:
@@ -369,6 +363,13 @@ class Engram_host(nn.Module):
             k_norm_weights.append(norm.weight.detach().cpu())
         key_norm_weight = torch.stack(k_norm_weights)
         
+        # 保持张量生命周期
+        self._value_proj_weight = value_proj_weight.contiguous()
+        self._value_proj_bias = value_proj_bias.contiguous()
+        self._key_proj_weights = key_proj_weights.contiguous()
+        self._key_proj_biases = key_proj_biases.contiguous()
+        self._key_norm_weight = key_norm_weight.contiguous()
+
         # 创建C++ Engram对象
         self.cpp_engram = engram_cpu.EngramCPU(
             layer_id=self.layer_id,
@@ -379,7 +380,13 @@ class Engram_host(nn.Module):
             offsets=offsets_np,
             embedding_weights=embedding_weights,
         )
-        self.cpp_engram.set_weights(key_proj_weights,key_proj_biases, key_norm_weight, value_proj_weight, value_proj_bias)
+        self.cpp_engram.set_weights(
+            self._key_proj_weights,
+            self._key_proj_biases,
+            self._key_norm_weight,
+            self._value_proj_weight,
+            self._value_proj_bias
+        )
 
     def _build_lookup_table(self):
         old2new = {}
@@ -451,7 +458,7 @@ class Engram_host(nn.Module):
         x = np.asarray(input_ids, dtype=np.int64)
         B, T = x.shape
 
-        multipliers = self.layer_multipliers[self.layer_id]
+        multipliers = self.layer_multipliers
 
         def shift_k(k: int) -> np.ndarray:
             if k == 0: return x
@@ -534,12 +541,18 @@ class Engram_host(nn.Module):
             normed_keys = []
             for hc_idx in range(backbone_config.hc_mult):
                 key = self.key_projs[hc_idx](embeddings)
+                #print(f"Engram_host forward {hc_idx}- embeddings: {embeddings}")
+                #print(f"Engram_host forward {hc_idx}- weight: {self.key_projs[hc_idx].weight}")
+                #print(f"Engram_host forward {hc_idx}- bias: {self.key_projs[hc_idx].bias}")
+                #print(f"Engram_host forward {hc_idx}- key: {key}")
                 normed_key = self.norm1[hc_idx](key)
                 normed_keys.append(normed_key)
             normed_keys = torch.stack(normed_keys)
+        #print(f"Engram_host forward - value: {value}")
         #print(f"Engram_host forward output - value: {value}\nnormed_keys:  {normed_keys}")
         return value, normed_keys
-    
+
+
 @wrap_in_hpu_graph
 class Engram_device(nn.Module):
     def __init__(self, layer_id,timer):
