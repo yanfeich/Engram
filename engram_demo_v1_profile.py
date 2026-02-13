@@ -128,7 +128,7 @@ class EngramConfig:
 
     # original config 0.662B
     #layer_ids: List[int] = field(default_factory=lambda: [1,15])
-    layer_ids: List[int] = field(default_factory=lambda: [1])
+    layer_ids: List[int] = field(default_factory=lambda: [1,3])
     engram_vocab_size: List[int] = field(default_factory=lambda: [129280*5, 129280*5])
     n_embed_per_ngram: int = 512
 

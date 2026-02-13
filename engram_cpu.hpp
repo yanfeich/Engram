@@ -102,8 +102,10 @@ private:
         dnnl::memory::desc bias_md;
         dnnl::matmul::primitive_desc value_pd;
         dnnl::matmul value_prim;
+        dnnl::memory value_weight_mem;
         std::vector<dnnl::matmul::primitive_desc> key_pds;
         std::vector<dnnl::matmul> key_prims;
+        std::vector<dnnl::memory> key_weight_mems;
         std::vector<dnnl::layer_normalization_forward::primitive_desc> norm_pds;
         std::vector<dnnl::layer_normalization_forward> norm_prims;
         std::vector<dnnl::memory> mean_mems;

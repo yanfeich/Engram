@@ -192,6 +192,13 @@ void EngramCPU::set_weights(const torch::Tensor& k_weight,
     }
 
     primitive_cache_.clear();
+    const std::vector<int64_t> prepack_ms = {16, 8192};
+    for (int64_t m : prepack_ms) {
+        if (m > 0) {
+            (void)get_or_create_cache(m);
+        }
+    }
+    stream_.wait();
 }
 
 EngramCPU::PrimitiveCache& EngramCPU::get_or_create_cache(int64_t m) {
@@ -205,18 +212,27 @@ EngramCPU::PrimitiveCache& EngramCPU::get_or_create_cache(int64_t m) {
     cache.src_md = memory::desc({m, config_.engram_hidden_size}, dtype_, memory::format_tag::ab);
     cache.dst_md = memory::desc({m, config_.hidden_size}, dtype_, memory::format_tag::ab);
     cache.bias_md = memory::desc({1, config_.hidden_size}, dtype_, memory::format_tag::ab);
+    auto weight_any_md = memory::desc({config_.engram_hidden_size, config_.hidden_size}, dtype_, memory::format_tag::any);
 
     cache.value_pd = matmul::primitive_desc(
         engine_,
         cache.src_md,
-        value_weight_.desc,
+        weight_any_md,
         cache.bias_md,
         cache.dst_md
     );
     cache.value_prim = matmul(cache.value_pd);
+    if (cache.value_pd.weights_desc() != value_weight_.desc) {
+        cache.value_weight_mem = memory(cache.value_pd.weights_desc(), engine_);
+        reorder(value_weight_.memory, cache.value_weight_mem)
+            .execute(stream_, value_weight_.memory, cache.value_weight_mem);
+    } else {
+        cache.value_weight_mem = value_weight_.memory;
+    }
 
     cache.key_pds.resize(config_.hc_mult);
     cache.key_prims.resize(config_.hc_mult);
+    cache.key_weight_mems.resize(config_.hc_mult);
     cache.norm_pds.resize(config_.hc_mult);
     cache.norm_prims.resize(config_.hc_mult);
     cache.mean_mems.resize(config_.hc_mult);
@@ -229,11 +245,18 @@ EngramCPU::PrimitiveCache& EngramCPU::get_or_create_cache(int64_t m) {
         cache.key_pds[hc_idx] = matmul::primitive_desc(
             engine_,
             cache.src_md,
-            key_weights_[hc_idx].desc,
+            weight_any_md,
             cache.bias_md,
             cache.dst_md
         );
         cache.key_prims[hc_idx] = matmul(cache.key_pds[hc_idx]);
+        if (cache.key_pds[hc_idx].weights_desc() != key_weights_[hc_idx].desc) {
+            cache.key_weight_mems[hc_idx] = memory(cache.key_pds[hc_idx].weights_desc(), engine_);
+            reorder(key_weights_[hc_idx].memory, cache.key_weight_mems[hc_idx])
+                .execute(stream_, key_weights_[hc_idx].memory, cache.key_weight_mems[hc_idx]);
+        } else {
+            cache.key_weight_mems[hc_idx] = key_weights_[hc_idx].memory;
+        }
 
         cache.norm_pds[hc_idx] = layer_normalization_forward::primitive_desc(
             engine_,
@@ -343,7 +366,12 @@ void EngramCPU::multi_head_embedding(const std::vector<int64_t>& hash_ids,
     }
 }
 
+static int64_t call_count = 0;
+static double t_compress = 0.0, t_hash = 0.0, t_embed = 0.0, t_vproj = 0.0, t_kproj = 0.0, t_knorm = 0.0, t_total = 0.0;
+
 std::pair<torch::Tensor, torch::Tensor> EngramCPU::forward(const torch::Tensor& input_ids) {
+    using Clock = std::chrono::high_resolution_clock;
+    auto t_start = Clock::now();
     // Ensure input is on CPU
     auto input_cpu = input_ids.to(torch::kCPU).contiguous();
     
@@ -355,20 +383,29 @@ std::pair<torch::Tensor, torch::Tensor> EngramCPU::forward(const torch::Tensor& 
     const int64_t* input_ptr = input_cpu.data_ptr<int64_t>();
     
     // Step 1: Compressed tokenizer
+    auto t1 = Clock::now();
     compressed_tokenizer(input_ptr, B, T, compressed_ids_buffer_);
+    auto t2 = Clock::now();
+    t_compress += std::chrono::duration<double, std::milli>(t2 - t1).count();
     // std::cout << "Compressed tokenizer." << std::endl;
     
     // Step 2: Get n-gram hashes
+    auto t3 = Clock::now();
     get_ngram_hashes(compressed_ids_buffer_, B, T, hash_ids_buffer_);
+    auto t4 = Clock::now();
+    t_hash += std::chrono::duration<double, std::milli>(t4 - t3).count();
     // std::cout << "Get n-gram hashes." << std::endl;
     
     // Step 3: Multi-head embedding
+    auto t5 = Clock::now();
     if (!embeddings_buffer_.defined() || embeddings_buffer_.sizes() != std::vector<int64_t>({B, T, total_heads_ * embed_dim_per_head_})) {
         embeddings_buffer_ = torch::empty({B, T, total_heads_ * embed_dim_per_head_},
                                           torch::TensorOptions().dtype(embedding_weights_.dtype()).device(torch::kCPU));
     }
     multi_head_embedding(hash_ids_buffer_, B, T, embeddings_buffer_);
     auto embeddings = embeddings_buffer_;
+    auto t6 = Clock::now();
+    t_embed += std::chrono::duration<double, std::milli>(t6 - t5).count();
     //auto emb_slice = embeddings.index({torch::indexing::Slice(0, 3), 0, torch::indexing::Slice(0, 8)});
     // std::cout << "embeddings[0:3, 0, 0:8]:\n" << emb_slice << std::endl;
     
@@ -377,6 +414,7 @@ std::pair<torch::Tensor, torch::Tensor> EngramCPU::forward(const torch::Tensor& 
     // 1. 计算value投影
 
     // 准备输出tensor
+    auto t7 = Clock::now();
     auto value = torch::empty({B, T, 1, config_.hidden_size}, 
                               torch::TensorOptions().dtype(embeddings.dtype()).device(torch::kCPU));
 
@@ -390,13 +428,15 @@ std::pair<torch::Tensor, torch::Tensor> EngramCPU::forward(const torch::Tensor& 
         
         // 执行
         value_matmul_args_[DNNL_ARG_SRC] = embeddings_mem;
-        value_matmul_args_[DNNL_ARG_WEIGHTS] = value_weight_.memory;
+        value_matmul_args_[DNNL_ARG_WEIGHTS] = cache.value_weight_mem;
         value_matmul_args_[DNNL_ARG_BIAS] = value_bias_.memory;
         value_matmul_args_[DNNL_ARG_DST] = value_output_mem;
         
         cache.value_prim.execute(stream_, value_matmul_args_);
     }
-    
+    stream_.wait();
+    auto t8 = Clock::now();
+    t_vproj += std::chrono::duration<double, std::milli>(t8 - t7).count();
 
     auto normed_keys = torch::empty({config_.hc_mult, B, T, config_.hidden_size}, 
                               torch::TensorOptions().dtype(embeddings.dtype()).device(torch::kCPU));
@@ -408,16 +448,21 @@ std::pair<torch::Tensor, torch::Tensor> EngramCPU::forward(const torch::Tensor& 
         memory key_output_mem(cache.dst_md, engine_, key_output_ptr);
         
         // 1. key matmul
+        auto t9 = Clock::now();
         {
             key_matmul_args_[hc_idx][DNNL_ARG_SRC] = embeddings_mem;
-            key_matmul_args_[hc_idx][DNNL_ARG_WEIGHTS] = key_weights_[hc_idx].memory;
+            key_matmul_args_[hc_idx][DNNL_ARG_WEIGHTS] = cache.key_weight_mems[hc_idx];
             key_matmul_args_[hc_idx][DNNL_ARG_BIAS] = key_biases_[hc_idx].memory;
             key_matmul_args_[hc_idx][DNNL_ARG_DST] = key_output_mem;
             
             cache.key_prims[hc_idx].execute(stream_, key_matmul_args_[hc_idx]);
         }
+        stream_.wait();
+        auto t10 = Clock::now();
+        t_kproj += std::chrono::duration<double, std::milli>(t10 - t9).count();
         // 2. norm (使用LayerNorm近似RMSNorm)
-        {
+        auto t11 = Clock::now();
+    {
             norm_args_[hc_idx][DNNL_ARG_SRC] = key_output_mem;
             norm_args_[hc_idx][DNNL_ARG_SCALE] = key_norm_weights_[hc_idx].memory;
             norm_args_[hc_idx][DNNL_ARG_MEAN] = cache.mean_mems[hc_idx];
@@ -426,9 +471,29 @@ std::pair<torch::Tensor, torch::Tensor> EngramCPU::forward(const torch::Tensor& 
             
             cache.norm_prims[hc_idx].execute(stream_, norm_args_[hc_idx]);
         }
+        stream_.wait();
+        auto t12 = Clock::now();
+        t_knorm += std::chrono::duration<double, std::milli>(t12 - t11).count();
     }
     stream_.wait();
     
+    auto t_end = Clock::now();
+    t_total += std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+
+    ++call_count;
+    if (call_count % 500 == 0) {
+        std::cout << "[forward_profile] avg(ms) compress=" << (t_compress / call_count)
+                  << ", hash=" << (t_hash / call_count)
+                  << ", embed=" << (t_embed / call_count)
+                  << ", vproj=" << (t_vproj / call_count)
+                  << ", kproj=" << (t_kproj / call_count)
+                  << ", knorm=" << (t_knorm / call_count)
+                  << ", total=" << ((t_compress + t_hash + t_embed + t_vproj + t_kproj + t_knorm) / call_count)
+                  << ", total=" << (t_total / call_count)
+                  << std::endl;
+    }
+
     // std::cout << "value shape: " << value.sizes() << std::endl;
     // std::cout << "normed_keys shape: " << normed_keys.sizes() << std::endl;
     return {value, normed_keys};
